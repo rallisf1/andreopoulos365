@@ -1,0 +1,4282 @@
+function noop() { }
+const identity = x => x;
+function assign(tar, src) {
+    // @ts-ignore
+    for (const k in src)
+        tar[k] = src[k];
+    return tar;
+}
+function run(fn) {
+    return fn();
+}
+function blank_object() {
+    return Object.create(null);
+}
+function run_all(fns) {
+    fns.forEach(run);
+}
+function is_function(thing) {
+    return typeof thing === 'function';
+}
+function safe_not_equal(a, b) {
+    return a != a ? b == b : a !== b || ((a && typeof a === 'object') || typeof a === 'function');
+}
+function is_empty(obj) {
+    return Object.keys(obj).length === 0;
+}
+function exclude_internal_props(props) {
+    const result = {};
+    for (const k in props)
+        if (k[0] !== '$')
+            result[k] = props[k];
+    return result;
+}
+
+const is_client = typeof window !== 'undefined';
+let now = is_client
+    ? () => window.performance.now()
+    : () => Date.now();
+let raf = is_client ? cb => requestAnimationFrame(cb) : noop;
+
+const tasks = new Set();
+function run_tasks(now) {
+    tasks.forEach(task => {
+        if (!task.c(now)) {
+            tasks.delete(task);
+            task.f();
+        }
+    });
+    if (tasks.size !== 0)
+        raf(run_tasks);
+}
+/**
+ * Creates a new task that runs on each raf frame
+ * until it returns a falsy value or is aborted
+ */
+function loop(callback) {
+    let task;
+    if (tasks.size === 0)
+        raf(run_tasks);
+    return {
+        promise: new Promise(fulfill => {
+            tasks.add(task = { c: callback, f: fulfill });
+        }),
+        abort() {
+            tasks.delete(task);
+        }
+    };
+}
+
+// Track which nodes are claimed during hydration. Unclaimed nodes can then be removed from the DOM
+// at the end of hydration without touching the remaining nodes.
+let is_hydrating = false;
+function start_hydrating() {
+    is_hydrating = true;
+}
+function end_hydrating() {
+    is_hydrating = false;
+}
+function upper_bound(low, high, key, value) {
+    // Return first index of value larger than input value in the range [low, high)
+    while (low < high) {
+        const mid = low + ((high - low) >> 1);
+        if (key(mid) <= value) {
+            low = mid + 1;
+        }
+        else {
+            high = mid;
+        }
+    }
+    return low;
+}
+function init_hydrate(target) {
+    if (target.hydrate_init)
+        return;
+    target.hydrate_init = true;
+    // We know that all children have claim_order values since the unclaimed have been detached if target is not <head>
+    let children = target.childNodes;
+    // If target is <head>, there may be children without claim_order
+    if (target.nodeName === 'HEAD') {
+        const myChildren = [];
+        for (let i = 0; i < children.length; i++) {
+            const node = children[i];
+            if (node.claim_order !== undefined) {
+                myChildren.push(node);
+            }
+        }
+        children = myChildren;
+    }
+    /*
+    * Reorder claimed children optimally.
+    * We can reorder claimed children optimally by finding the longest subsequence of
+    * nodes that are already claimed in order and only moving the rest. The longest
+    * subsequence of nodes that are claimed in order can be found by
+    * computing the longest increasing subsequence of .claim_order values.
+    *
+    * This algorithm is optimal in generating the least amount of reorder operations
+    * possible.
+    *
+    * Proof:
+    * We know that, given a set of reordering operations, the nodes that do not move
+    * always form an increasing subsequence, since they do not move among each other
+    * meaning that they must be already ordered among each other. Thus, the maximal
+    * set of nodes that do not move form a longest increasing subsequence.
+    */
+    // Compute longest increasing subsequence
+    // m: subsequence length j => index k of smallest value that ends an increasing subsequence of length j
+    const m = new Int32Array(children.length + 1);
+    // Predecessor indices + 1
+    const p = new Int32Array(children.length);
+    m[0] = -1;
+    let longest = 0;
+    for (let i = 0; i < children.length; i++) {
+        const current = children[i].claim_order;
+        // Find the largest subsequence length such that it ends in a value less than our current value
+        // upper_bound returns first greater value, so we subtract one
+        // with fast path for when we are on the current longest subsequence
+        const seqLen = ((longest > 0 && children[m[longest]].claim_order <= current) ? longest + 1 : upper_bound(1, longest, idx => children[m[idx]].claim_order, current)) - 1;
+        p[i] = m[seqLen] + 1;
+        const newLen = seqLen + 1;
+        // We can guarantee that current is the smallest value. Otherwise, we would have generated a longer sequence.
+        m[newLen] = i;
+        longest = Math.max(newLen, longest);
+    }
+    // The longest increasing subsequence of nodes (initially reversed)
+    const lis = [];
+    // The rest of the nodes, nodes that will be moved
+    const toMove = [];
+    let last = children.length - 1;
+    for (let cur = m[longest] + 1; cur != 0; cur = p[cur - 1]) {
+        lis.push(children[cur - 1]);
+        for (; last >= cur; last--) {
+            toMove.push(children[last]);
+        }
+        last--;
+    }
+    for (; last >= 0; last--) {
+        toMove.push(children[last]);
+    }
+    lis.reverse();
+    // We sort the nodes being moved to guarantee that their insertion order matches the claim order
+    toMove.sort((a, b) => a.claim_order - b.claim_order);
+    // Finally, we move the nodes
+    for (let i = 0, j = 0; i < toMove.length; i++) {
+        while (j < lis.length && toMove[i].claim_order >= lis[j].claim_order) {
+            j++;
+        }
+        const anchor = j < lis.length ? lis[j] : null;
+        target.insertBefore(toMove[i], anchor);
+    }
+}
+function append(target, node) {
+    target.appendChild(node);
+}
+function get_root_for_style(node) {
+    if (!node)
+        return document;
+    const root = node.getRootNode ? node.getRootNode() : node.ownerDocument;
+    if (root && root.host) {
+        return root;
+    }
+    return node.ownerDocument;
+}
+function append_empty_stylesheet(node) {
+    const style_element = element('style');
+    append_stylesheet(get_root_for_style(node), style_element);
+    return style_element.sheet;
+}
+function append_stylesheet(node, style) {
+    append(node.head || node, style);
+    return style.sheet;
+}
+function append_hydration(target, node) {
+    if (is_hydrating) {
+        init_hydrate(target);
+        if ((target.actual_end_child === undefined) || ((target.actual_end_child !== null) && (target.actual_end_child.parentNode !== target))) {
+            target.actual_end_child = target.firstChild;
+        }
+        // Skip nodes of undefined ordering
+        while ((target.actual_end_child !== null) && (target.actual_end_child.claim_order === undefined)) {
+            target.actual_end_child = target.actual_end_child.nextSibling;
+        }
+        if (node !== target.actual_end_child) {
+            // We only insert if the ordering of this node should be modified or the parent node is not target
+            if (node.claim_order !== undefined || node.parentNode !== target) {
+                target.insertBefore(node, target.actual_end_child);
+            }
+        }
+        else {
+            target.actual_end_child = node.nextSibling;
+        }
+    }
+    else if (node.parentNode !== target || node.nextSibling !== null) {
+        target.appendChild(node);
+    }
+}
+function insert_hydration(target, node, anchor) {
+    if (is_hydrating && !anchor) {
+        append_hydration(target, node);
+    }
+    else if (node.parentNode !== target || node.nextSibling != anchor) {
+        target.insertBefore(node, anchor || null);
+    }
+}
+function detach(node) {
+    if (node.parentNode) {
+        node.parentNode.removeChild(node);
+    }
+}
+function destroy_each(iterations, detaching) {
+    for (let i = 0; i < iterations.length; i += 1) {
+        if (iterations[i])
+            iterations[i].d(detaching);
+    }
+}
+function element(name) {
+    return document.createElement(name);
+}
+function svg_element(name) {
+    return document.createElementNS('http://www.w3.org/2000/svg', name);
+}
+function text(data) {
+    return document.createTextNode(data);
+}
+function space() {
+    return text(' ');
+}
+function empty() {
+    return text('');
+}
+function listen(node, event, handler, options) {
+    node.addEventListener(event, handler, options);
+    return () => node.removeEventListener(event, handler, options);
+}
+function prevent_default(fn) {
+    return function (event) {
+        event.preventDefault();
+        // @ts-ignore
+        return fn.call(this, event);
+    };
+}
+function attr(node, attribute, value) {
+    if (value == null)
+        node.removeAttribute(attribute);
+    else if (node.getAttribute(attribute) !== value)
+        node.setAttribute(attribute, value);
+}
+function set_attributes(node, attributes) {
+    // @ts-ignore
+    const descriptors = Object.getOwnPropertyDescriptors(node.__proto__);
+    for (const key in attributes) {
+        if (attributes[key] == null) {
+            node.removeAttribute(key);
+        }
+        else if (key === 'style') {
+            node.style.cssText = attributes[key];
+        }
+        else if (key === '__value') {
+            node.value = node[key] = attributes[key];
+        }
+        else if (descriptors[key] && descriptors[key].set) {
+            node[key] = attributes[key];
+        }
+        else {
+            attr(node, key, attributes[key]);
+        }
+    }
+}
+function set_svg_attributes(node, attributes) {
+    for (const key in attributes) {
+        attr(node, key, attributes[key]);
+    }
+}
+function children(element) {
+    return Array.from(element.childNodes);
+}
+function init_claim_info(nodes) {
+    if (nodes.claim_info === undefined) {
+        nodes.claim_info = { last_index: 0, total_claimed: 0 };
+    }
+}
+function claim_node(nodes, predicate, processNode, createNode, dontUpdateLastIndex = false) {
+    // Try to find nodes in an order such that we lengthen the longest increasing subsequence
+    init_claim_info(nodes);
+    const resultNode = (() => {
+        // We first try to find an element after the previous one
+        for (let i = nodes.claim_info.last_index; i < nodes.length; i++) {
+            const node = nodes[i];
+            if (predicate(node)) {
+                const replacement = processNode(node);
+                if (replacement === undefined) {
+                    nodes.splice(i, 1);
+                }
+                else {
+                    nodes[i] = replacement;
+                }
+                if (!dontUpdateLastIndex) {
+                    nodes.claim_info.last_index = i;
+                }
+                return node;
+            }
+        }
+        // Otherwise, we try to find one before
+        // We iterate in reverse so that we don't go too far back
+        for (let i = nodes.claim_info.last_index - 1; i >= 0; i--) {
+            const node = nodes[i];
+            if (predicate(node)) {
+                const replacement = processNode(node);
+                if (replacement === undefined) {
+                    nodes.splice(i, 1);
+                }
+                else {
+                    nodes[i] = replacement;
+                }
+                if (!dontUpdateLastIndex) {
+                    nodes.claim_info.last_index = i;
+                }
+                else if (replacement === undefined) {
+                    // Since we spliced before the last_index, we decrease it
+                    nodes.claim_info.last_index--;
+                }
+                return node;
+            }
+        }
+        // If we can't find any matching node, we create a new one
+        return createNode();
+    })();
+    resultNode.claim_order = nodes.claim_info.total_claimed;
+    nodes.claim_info.total_claimed += 1;
+    return resultNode;
+}
+function claim_element_base(nodes, name, attributes, create_element) {
+    return claim_node(nodes, (node) => node.nodeName === name, (node) => {
+        const remove = [];
+        for (let j = 0; j < node.attributes.length; j++) {
+            const attribute = node.attributes[j];
+            if (!attributes[attribute.name]) {
+                remove.push(attribute.name);
+            }
+        }
+        remove.forEach(v => node.removeAttribute(v));
+        return undefined;
+    }, () => create_element(name));
+}
+function claim_element(nodes, name, attributes) {
+    return claim_element_base(nodes, name, attributes, element);
+}
+function claim_svg_element(nodes, name, attributes) {
+    return claim_element_base(nodes, name, attributes, svg_element);
+}
+function claim_text(nodes, data) {
+    return claim_node(nodes, (node) => node.nodeType === 3, (node) => {
+        const dataStr = '' + data;
+        if (node.data.startsWith(dataStr)) {
+            if (node.data.length !== dataStr.length) {
+                return node.splitText(dataStr.length);
+            }
+        }
+        else {
+            node.data = dataStr;
+        }
+    }, () => text(data), true // Text nodes should not update last index since it is likely not worth it to eliminate an increasing subsequence of actual elements
+    );
+}
+function claim_space(nodes) {
+    return claim_text(nodes, ' ');
+}
+function set_data(text, data) {
+    data = '' + data;
+    if (text.wholeText !== data)
+        text.data = data;
+}
+function toggle_class(element, name, toggle) {
+    element.classList[toggle ? 'add' : 'remove'](name);
+}
+function custom_event(type, detail, { bubbles = false, cancelable = false } = {}) {
+    const e = document.createEvent('CustomEvent');
+    e.initCustomEvent(type, bubbles, cancelable, detail);
+    return e;
+}
+
+// we need to store the information for multiple documents because a Svelte application could also contain iframes
+// https://github.com/sveltejs/svelte/issues/3624
+const managed_styles = new Map();
+let active = 0;
+// https://github.com/darkskyapp/string-hash/blob/master/index.js
+function hash(str) {
+    let hash = 5381;
+    let i = str.length;
+    while (i--)
+        hash = ((hash << 5) - hash) ^ str.charCodeAt(i);
+    return hash >>> 0;
+}
+function create_style_information(doc, node) {
+    const info = { stylesheet: append_empty_stylesheet(node), rules: {} };
+    managed_styles.set(doc, info);
+    return info;
+}
+function create_rule(node, a, b, duration, delay, ease, fn, uid = 0) {
+    const step = 16.666 / duration;
+    let keyframes = '{\n';
+    for (let p = 0; p <= 1; p += step) {
+        const t = a + (b - a) * ease(p);
+        keyframes += p * 100 + `%{${fn(t, 1 - t)}}\n`;
+    }
+    const rule = keyframes + `100% {${fn(b, 1 - b)}}\n}`;
+    const name = `__svelte_${hash(rule)}_${uid}`;
+    const doc = get_root_for_style(node);
+    const { stylesheet, rules } = managed_styles.get(doc) || create_style_information(doc, node);
+    if (!rules[name]) {
+        rules[name] = true;
+        stylesheet.insertRule(`@keyframes ${name} ${rule}`, stylesheet.cssRules.length);
+    }
+    const animation = node.style.animation || '';
+    node.style.animation = `${animation ? `${animation}, ` : ''}${name} ${duration}ms linear ${delay}ms 1 both`;
+    active += 1;
+    return name;
+}
+function delete_rule(node, name) {
+    const previous = (node.style.animation || '').split(', ');
+    const next = previous.filter(name
+        ? anim => anim.indexOf(name) < 0 // remove specific animation
+        : anim => anim.indexOf('__svelte') === -1 // remove all Svelte animations
+    );
+    const deleted = previous.length - next.length;
+    if (deleted) {
+        node.style.animation = next.join(', ');
+        active -= deleted;
+        if (!active)
+            clear_rules();
+    }
+}
+function clear_rules() {
+    raf(() => {
+        if (active)
+            return;
+        managed_styles.forEach(info => {
+            const { ownerNode } = info.stylesheet;
+            // there is no ownerNode if it runs on jsdom.
+            if (ownerNode)
+                detach(ownerNode);
+        });
+        managed_styles.clear();
+    });
+}
+
+let current_component;
+function set_current_component(component) {
+    current_component = component;
+}
+function get_current_component() {
+    if (!current_component)
+        throw new Error('Function called outside component initialization');
+    return current_component;
+}
+/**
+ * The `onMount` function schedules a callback to run as soon as the component has been mounted to the DOM.
+ * It must be called during the component's initialisation (but doesn't need to live *inside* the component;
+ * it can be called from an external module).
+ *
+ * `onMount` does not run inside a [server-side component](/docs#run-time-server-side-component-api).
+ *
+ * https://svelte.dev/docs#run-time-svelte-onmount
+ */
+function onMount(fn) {
+    get_current_component().$$.on_mount.push(fn);
+}
+/**
+ * Schedules a callback to run immediately before the component is unmounted.
+ *
+ * Out of `onMount`, `beforeUpdate`, `afterUpdate` and `onDestroy`, this is the
+ * only one that runs inside a server-side component.
+ *
+ * https://svelte.dev/docs#run-time-svelte-ondestroy
+ */
+function onDestroy(fn) {
+    get_current_component().$$.on_destroy.push(fn);
+}
+/**
+ * Creates an event dispatcher that can be used to dispatch [component events](/docs#template-syntax-component-directives-on-eventname).
+ * Event dispatchers are functions that can take two arguments: `name` and `detail`.
+ *
+ * Component events created with `createEventDispatcher` create a
+ * [CustomEvent](https://developer.mozilla.org/en-US/docs/Web/API/CustomEvent).
+ * These events do not [bubble](https://developer.mozilla.org/en-US/docs/Learn/JavaScript/Building_blocks/Events#Event_bubbling_and_capture).
+ * The `detail` argument corresponds to the [CustomEvent.detail](https://developer.mozilla.org/en-US/docs/Web/API/CustomEvent/detail)
+ * property and can contain any type of data.
+ *
+ * https://svelte.dev/docs#run-time-svelte-createeventdispatcher
+ */
+function createEventDispatcher() {
+    const component = get_current_component();
+    return (type, detail, { cancelable = false } = {}) => {
+        const callbacks = component.$$.callbacks[type];
+        if (callbacks) {
+            // TODO are there situations where events could be dispatched
+            // in a server (non-DOM) environment?
+            const event = custom_event(type, detail, { cancelable });
+            callbacks.slice().forEach(fn => {
+                fn.call(component, event);
+            });
+            return !event.defaultPrevented;
+        }
+        return true;
+    };
+}
+
+const dirty_components = [];
+const binding_callbacks = [];
+const render_callbacks = [];
+const flush_callbacks = [];
+const resolved_promise = Promise.resolve();
+let update_scheduled = false;
+function schedule_update() {
+    if (!update_scheduled) {
+        update_scheduled = true;
+        resolved_promise.then(flush);
+    }
+}
+function add_render_callback(fn) {
+    render_callbacks.push(fn);
+}
+// flush() calls callbacks in this order:
+// 1. All beforeUpdate callbacks, in order: parents before children
+// 2. All bind:this callbacks, in reverse order: children before parents.
+// 3. All afterUpdate callbacks, in order: parents before children. EXCEPT
+//    for afterUpdates called during the initial onMount, which are called in
+//    reverse order: children before parents.
+// Since callbacks might update component values, which could trigger another
+// call to flush(), the following steps guard against this:
+// 1. During beforeUpdate, any updated components will be added to the
+//    dirty_components array and will cause a reentrant call to flush(). Because
+//    the flush index is kept outside the function, the reentrant call will pick
+//    up where the earlier call left off and go through all dirty components. The
+//    current_component value is saved and restored so that the reentrant call will
+//    not interfere with the "parent" flush() call.
+// 2. bind:this callbacks cannot trigger new flush() calls.
+// 3. During afterUpdate, any updated components will NOT have their afterUpdate
+//    callback called a second time; the seen_callbacks set, outside the flush()
+//    function, guarantees this behavior.
+const seen_callbacks = new Set();
+let flushidx = 0; // Do *not* move this inside the flush() function
+function flush() {
+    const saved_component = current_component;
+    do {
+        // first, call beforeUpdate functions
+        // and update components
+        while (flushidx < dirty_components.length) {
+            const component = dirty_components[flushidx];
+            flushidx++;
+            set_current_component(component);
+            update(component.$$);
+        }
+        set_current_component(null);
+        dirty_components.length = 0;
+        flushidx = 0;
+        while (binding_callbacks.length)
+            binding_callbacks.pop()();
+        // then, once components are updated, call
+        // afterUpdate functions. This may cause
+        // subsequent updates...
+        for (let i = 0; i < render_callbacks.length; i += 1) {
+            const callback = render_callbacks[i];
+            if (!seen_callbacks.has(callback)) {
+                // ...so guard against infinite loops
+                seen_callbacks.add(callback);
+                callback();
+            }
+        }
+        render_callbacks.length = 0;
+    } while (dirty_components.length);
+    while (flush_callbacks.length) {
+        flush_callbacks.pop()();
+    }
+    update_scheduled = false;
+    seen_callbacks.clear();
+    set_current_component(saved_component);
+}
+function update($$) {
+    if ($$.fragment !== null) {
+        $$.update();
+        run_all($$.before_update);
+        const dirty = $$.dirty;
+        $$.dirty = [-1];
+        $$.fragment && $$.fragment.p($$.ctx, dirty);
+        $$.after_update.forEach(add_render_callback);
+    }
+}
+
+let promise;
+function wait() {
+    if (!promise) {
+        promise = Promise.resolve();
+        promise.then(() => {
+            promise = null;
+        });
+    }
+    return promise;
+}
+function dispatch(node, direction, kind) {
+    node.dispatchEvent(custom_event(`${direction ? 'intro' : 'outro'}${kind}`));
+}
+const outroing = new Set();
+let outros;
+function group_outros() {
+    outros = {
+        r: 0,
+        c: [],
+        p: outros // parent group
+    };
+}
+function check_outros() {
+    if (!outros.r) {
+        run_all(outros.c);
+    }
+    outros = outros.p;
+}
+function transition_in(block, local) {
+    if (block && block.i) {
+        outroing.delete(block);
+        block.i(local);
+    }
+}
+function transition_out(block, local, detach, callback) {
+    if (block && block.o) {
+        if (outroing.has(block))
+            return;
+        outroing.add(block);
+        outros.c.push(() => {
+            outroing.delete(block);
+            if (callback) {
+                if (detach)
+                    block.d(1);
+                callback();
+            }
+        });
+        block.o(local);
+    }
+    else if (callback) {
+        callback();
+    }
+}
+const null_transition = { duration: 0 };
+function create_bidirectional_transition(node, fn, params, intro) {
+    let config = fn(node, params);
+    let t = intro ? 0 : 1;
+    let running_program = null;
+    let pending_program = null;
+    let animation_name = null;
+    function clear_animation() {
+        if (animation_name)
+            delete_rule(node, animation_name);
+    }
+    function init(program, duration) {
+        const d = (program.b - t);
+        duration *= Math.abs(d);
+        return {
+            a: t,
+            b: program.b,
+            d,
+            duration,
+            start: program.start,
+            end: program.start + duration,
+            group: program.group
+        };
+    }
+    function go(b) {
+        const { delay = 0, duration = 300, easing = identity, tick = noop, css } = config || null_transition;
+        const program = {
+            start: now() + delay,
+            b
+        };
+        if (!b) {
+            // @ts-ignore todo: improve typings
+            program.group = outros;
+            outros.r += 1;
+        }
+        if (running_program || pending_program) {
+            pending_program = program;
+        }
+        else {
+            // if this is an intro, and there's a delay, we need to do
+            // an initial tick and/or apply CSS animation immediately
+            if (css) {
+                clear_animation();
+                animation_name = create_rule(node, t, b, duration, delay, easing, css);
+            }
+            if (b)
+                tick(0, 1);
+            running_program = init(program, duration);
+            add_render_callback(() => dispatch(node, b, 'start'));
+            loop(now => {
+                if (pending_program && now > pending_program.start) {
+                    running_program = init(pending_program, duration);
+                    pending_program = null;
+                    dispatch(node, running_program.b, 'start');
+                    if (css) {
+                        clear_animation();
+                        animation_name = create_rule(node, t, running_program.b, running_program.duration, 0, easing, config.css);
+                    }
+                }
+                if (running_program) {
+                    if (now >= running_program.end) {
+                        tick(t = running_program.b, 1 - t);
+                        dispatch(node, running_program.b, 'end');
+                        if (!pending_program) {
+                            // we're done
+                            if (running_program.b) {
+                                // intro — we can tidy up immediately
+                                clear_animation();
+                            }
+                            else {
+                                // outro — needs to be coordinated
+                                if (!--running_program.group.r)
+                                    run_all(running_program.group.c);
+                            }
+                        }
+                        running_program = null;
+                    }
+                    else if (now >= running_program.start) {
+                        const p = now - running_program.start;
+                        t = running_program.a + running_program.d * easing(p / running_program.duration);
+                        tick(t, 1 - t);
+                    }
+                }
+                return !!(running_program || pending_program);
+            });
+        }
+    }
+    return {
+        run(b) {
+            if (is_function(config)) {
+                wait().then(() => {
+                    // @ts-ignore
+                    config = config();
+                    go(b);
+                });
+            }
+            else {
+                go(b);
+            }
+        },
+        end() {
+            clear_animation();
+            running_program = pending_program = null;
+        }
+    };
+}
+
+function get_spread_update(levels, updates) {
+    const update = {};
+    const to_null_out = {};
+    const accounted_for = { $$scope: 1 };
+    let i = levels.length;
+    while (i--) {
+        const o = levels[i];
+        const n = updates[i];
+        if (n) {
+            for (const key in o) {
+                if (!(key in n))
+                    to_null_out[key] = 1;
+            }
+            for (const key in n) {
+                if (!accounted_for[key]) {
+                    update[key] = n[key];
+                    accounted_for[key] = 1;
+                }
+            }
+            levels[i] = n;
+        }
+        else {
+            for (const key in o) {
+                accounted_for[key] = 1;
+            }
+        }
+    }
+    for (const key in to_null_out) {
+        if (!(key in update))
+            update[key] = undefined;
+    }
+    return update;
+}
+function create_component(block) {
+    block && block.c();
+}
+function claim_component(block, parent_nodes) {
+    block && block.l(parent_nodes);
+}
+function mount_component(component, target, anchor, customElement) {
+    const { fragment, after_update } = component.$$;
+    fragment && fragment.m(target, anchor);
+    if (!customElement) {
+        // onMount happens before the initial afterUpdate
+        add_render_callback(() => {
+            const new_on_destroy = component.$$.on_mount.map(run).filter(is_function);
+            // if the component was destroyed immediately
+            // it will update the `$$.on_destroy` reference to `null`.
+            // the destructured on_destroy may still reference to the old array
+            if (component.$$.on_destroy) {
+                component.$$.on_destroy.push(...new_on_destroy);
+            }
+            else {
+                // Edge case - component was destroyed immediately,
+                // most likely as a result of a binding initialising
+                run_all(new_on_destroy);
+            }
+            component.$$.on_mount = [];
+        });
+    }
+    after_update.forEach(add_render_callback);
+}
+function destroy_component(component, detaching) {
+    const $$ = component.$$;
+    if ($$.fragment !== null) {
+        run_all($$.on_destroy);
+        $$.fragment && $$.fragment.d(detaching);
+        // TODO null out other refs, including component.$$ (but need to
+        // preserve final state?)
+        $$.on_destroy = $$.fragment = null;
+        $$.ctx = [];
+    }
+}
+function make_dirty(component, i) {
+    if (component.$$.dirty[0] === -1) {
+        dirty_components.push(component);
+        schedule_update();
+        component.$$.dirty.fill(0);
+    }
+    component.$$.dirty[(i / 31) | 0] |= (1 << (i % 31));
+}
+function init(component, options, instance, create_fragment, not_equal, props, append_styles, dirty = [-1]) {
+    const parent_component = current_component;
+    set_current_component(component);
+    const $$ = component.$$ = {
+        fragment: null,
+        ctx: [],
+        // state
+        props,
+        update: noop,
+        not_equal,
+        bound: blank_object(),
+        // lifecycle
+        on_mount: [],
+        on_destroy: [],
+        on_disconnect: [],
+        before_update: [],
+        after_update: [],
+        context: new Map(options.context || (parent_component ? parent_component.$$.context : [])),
+        // everything else
+        callbacks: blank_object(),
+        dirty,
+        skip_bound: false,
+        root: options.target || parent_component.$$.root
+    };
+    append_styles && append_styles($$.root);
+    let ready = false;
+    $$.ctx = instance
+        ? instance(component, options.props || {}, (i, ret, ...rest) => {
+            const value = rest.length ? rest[0] : ret;
+            if ($$.ctx && not_equal($$.ctx[i], $$.ctx[i] = value)) {
+                if (!$$.skip_bound && $$.bound[i])
+                    $$.bound[i](value);
+                if (ready)
+                    make_dirty(component, i);
+            }
+            return ret;
+        })
+        : [];
+    $$.update();
+    ready = true;
+    run_all($$.before_update);
+    // `false` as a special case of no DOM component
+    $$.fragment = create_fragment ? create_fragment($$.ctx) : false;
+    if (options.target) {
+        if (options.hydrate) {
+            start_hydrating();
+            const nodes = children(options.target);
+            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+            $$.fragment && $$.fragment.l(nodes);
+            nodes.forEach(detach);
+        }
+        else {
+            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+            $$.fragment && $$.fragment.c();
+        }
+        if (options.intro)
+            transition_in(component.$$.fragment);
+        mount_component(component, options.target, options.anchor, options.customElement);
+        end_hydrating();
+        flush();
+    }
+    set_current_component(parent_component);
+}
+/**
+ * Base class for Svelte components. Used when dev=false.
+ */
+class SvelteComponent {
+    $destroy() {
+        destroy_component(this, 1);
+        this.$destroy = noop;
+    }
+    $on(type, callback) {
+        if (!is_function(callback)) {
+            return noop;
+        }
+        const callbacks = (this.$$.callbacks[type] || (this.$$.callbacks[type] = []));
+        callbacks.push(callback);
+        return () => {
+            const index = callbacks.indexOf(callback);
+            if (index !== -1)
+                callbacks.splice(index, 1);
+        };
+    }
+    $set($$props) {
+        if (this.$$set && !is_empty($$props)) {
+            this.$$.skip_bound = true;
+            this.$$set($$props);
+            this.$$.skip_bound = false;
+        }
+    }
+}
+
+const matchIconName = /^[a-z0-9]+(-[a-z0-9]+)*$/;
+const stringToIcon = (value, validate, allowSimpleName, provider = "") => {
+  const colonSeparated = value.split(":");
+  if (value.slice(0, 1) === "@") {
+    if (colonSeparated.length < 2 || colonSeparated.length > 3) {
+      return null;
+    }
+    provider = colonSeparated.shift().slice(1);
+  }
+  if (colonSeparated.length > 3 || !colonSeparated.length) {
+    return null;
+  }
+  if (colonSeparated.length > 1) {
+    const name2 = colonSeparated.pop();
+    const prefix = colonSeparated.pop();
+    const result = {
+      provider: colonSeparated.length > 0 ? colonSeparated[0] : provider,
+      prefix,
+      name: name2
+    };
+    return validate && !validateIconName(result) ? null : result;
+  }
+  const name = colonSeparated[0];
+  const dashSeparated = name.split("-");
+  if (dashSeparated.length > 1) {
+    const result = {
+      provider,
+      prefix: dashSeparated.shift(),
+      name: dashSeparated.join("-")
+    };
+    return validate && !validateIconName(result) ? null : result;
+  }
+  if (allowSimpleName && provider === "") {
+    const result = {
+      provider,
+      prefix: "",
+      name
+    };
+    return validate && !validateIconName(result, allowSimpleName) ? null : result;
+  }
+  return null;
+};
+const validateIconName = (icon, allowSimpleName) => {
+  if (!icon) {
+    return false;
+  }
+  return !!((icon.provider === "" || icon.provider.match(matchIconName)) && (allowSimpleName && icon.prefix === "" || icon.prefix.match(matchIconName)) && icon.name.match(matchIconName));
+};
+const defaultIconDimensions = Object.freeze({
+  left: 0,
+  top: 0,
+  width: 16,
+  height: 16
+});
+const defaultIconTransformations = Object.freeze({
+  rotate: 0,
+  vFlip: false,
+  hFlip: false
+});
+const defaultIconProps = Object.freeze({
+  ...defaultIconDimensions,
+  ...defaultIconTransformations
+});
+const defaultExtendedIconProps = Object.freeze({
+  ...defaultIconProps,
+  body: "",
+  hidden: false
+});
+function mergeIconTransformations(obj1, obj2) {
+  const result = {};
+  if (!obj1.hFlip !== !obj2.hFlip) {
+    result.hFlip = true;
+  }
+  if (!obj1.vFlip !== !obj2.vFlip) {
+    result.vFlip = true;
+  }
+  const rotate = ((obj1.rotate || 0) + (obj2.rotate || 0)) % 4;
+  if (rotate) {
+    result.rotate = rotate;
+  }
+  return result;
+}
+function mergeIconData(parent, child) {
+  const result = mergeIconTransformations(parent, child);
+  for (const key in defaultExtendedIconProps) {
+    if (key in defaultIconTransformations) {
+      if (key in parent && !(key in result)) {
+        result[key] = defaultIconTransformations[key];
+      }
+    } else if (key in child) {
+      result[key] = child[key];
+    } else if (key in parent) {
+      result[key] = parent[key];
+    }
+  }
+  return result;
+}
+function getIconsTree(data, names) {
+  const icons = data.icons;
+  const aliases = data.aliases || {};
+  const resolved = /* @__PURE__ */ Object.create(null);
+  function resolve(name) {
+    if (icons[name]) {
+      return resolved[name] = [];
+    }
+    if (!(name in resolved)) {
+      resolved[name] = null;
+      const parent = aliases[name] && aliases[name].parent;
+      const value = parent && resolve(parent);
+      if (value) {
+        resolved[name] = [parent].concat(value);
+      }
+    }
+    return resolved[name];
+  }
+  (names || Object.keys(icons).concat(Object.keys(aliases))).forEach(resolve);
+  return resolved;
+}
+function internalGetIconData(data, name, tree) {
+  const icons = data.icons;
+  const aliases = data.aliases || {};
+  let currentProps = {};
+  function parse(name2) {
+    currentProps = mergeIconData(icons[name2] || aliases[name2], currentProps);
+  }
+  parse(name);
+  tree.forEach(parse);
+  return mergeIconData(data, currentProps);
+}
+function parseIconSet(data, callback) {
+  const names = [];
+  if (typeof data !== "object" || typeof data.icons !== "object") {
+    return names;
+  }
+  if (data.not_found instanceof Array) {
+    data.not_found.forEach((name) => {
+      callback(name, null);
+      names.push(name);
+    });
+  }
+  const tree = getIconsTree(data);
+  for (const name in tree) {
+    const item = tree[name];
+    if (item) {
+      callback(name, internalGetIconData(data, name, item));
+      names.push(name);
+    }
+  }
+  return names;
+}
+const optionalPropertyDefaults = {
+  provider: "",
+  aliases: {},
+  not_found: {},
+  ...defaultIconDimensions
+};
+function checkOptionalProps(item, defaults) {
+  for (const prop in defaults) {
+    if (prop in item && typeof item[prop] !== typeof defaults[prop]) {
+      return false;
+    }
+  }
+  return true;
+}
+function quicklyValidateIconSet(obj) {
+  if (typeof obj !== "object" || obj === null) {
+    return null;
+  }
+  const data = obj;
+  if (typeof data.prefix !== "string" || !obj.icons || typeof obj.icons !== "object") {
+    return null;
+  }
+  if (!checkOptionalProps(obj, optionalPropertyDefaults)) {
+    return null;
+  }
+  const icons = data.icons;
+  for (const name in icons) {
+    const icon = icons[name];
+    if (!name.match(matchIconName) || typeof icon.body !== "string" || !checkOptionalProps(icon, defaultExtendedIconProps)) {
+      return null;
+    }
+  }
+  const aliases = data.aliases || {};
+  for (const name in aliases) {
+    const icon = aliases[name];
+    const parent = icon.parent;
+    if (!name.match(matchIconName) || typeof parent !== "string" || !icons[parent] && !aliases[parent] || !checkOptionalProps(icon, defaultExtendedIconProps)) {
+      return null;
+    }
+  }
+  return data;
+}
+const dataStorage = /* @__PURE__ */ Object.create(null);
+function newStorage(provider, prefix) {
+  return {
+    provider,
+    prefix,
+    icons: /* @__PURE__ */ Object.create(null),
+    missing: /* @__PURE__ */ new Set()
+  };
+}
+function getStorage(provider, prefix) {
+  const providerStorage = dataStorage[provider] || (dataStorage[provider] = /* @__PURE__ */ Object.create(null));
+  return providerStorage[prefix] || (providerStorage[prefix] = newStorage(provider, prefix));
+}
+function addIconSet(storage2, data) {
+  if (!quicklyValidateIconSet(data)) {
+    return [];
+  }
+  return parseIconSet(data, (name, icon) => {
+    if (icon) {
+      storage2.icons[name] = icon;
+    } else {
+      storage2.missing.add(name);
+    }
+  });
+}
+function addIconToStorage(storage2, name, icon) {
+  try {
+    if (typeof icon.body === "string") {
+      storage2.icons[name] = {...icon};
+      return true;
+    }
+  } catch (err) {
+  }
+  return false;
+}
+let simpleNames = false;
+function allowSimpleNames(allow) {
+  if (typeof allow === "boolean") {
+    simpleNames = allow;
+  }
+  return simpleNames;
+}
+function getIconData(name) {
+  const icon = typeof name === "string" ? stringToIcon(name, true, simpleNames) : name;
+  if (icon) {
+    const storage2 = getStorage(icon.provider, icon.prefix);
+    const iconName = icon.name;
+    return storage2.icons[iconName] || (storage2.missing.has(iconName) ? null : void 0);
+  }
+}
+function addIcon(name, data) {
+  const icon = stringToIcon(name, true, simpleNames);
+  if (!icon) {
+    return false;
+  }
+  const storage2 = getStorage(icon.provider, icon.prefix);
+  return addIconToStorage(storage2, icon.name, data);
+}
+function addCollection(data, provider) {
+  if (typeof data !== "object") {
+    return false;
+  }
+  if (typeof provider !== "string") {
+    provider = data.provider || "";
+  }
+  if (simpleNames && !provider && !data.prefix) {
+    let added = false;
+    if (quicklyValidateIconSet(data)) {
+      data.prefix = "";
+      parseIconSet(data, (name, icon) => {
+        if (icon && addIcon(name, icon)) {
+          added = true;
+        }
+      });
+    }
+    return added;
+  }
+  const prefix = data.prefix;
+  if (!validateIconName({
+    provider,
+    prefix,
+    name: "a"
+  })) {
+    return false;
+  }
+  const storage2 = getStorage(provider, prefix);
+  return !!addIconSet(storage2, data);
+}
+const defaultIconSizeCustomisations = Object.freeze({
+  width: null,
+  height: null
+});
+const defaultIconCustomisations = Object.freeze({
+  ...defaultIconSizeCustomisations,
+  ...defaultIconTransformations
+});
+const unitsSplit = /(-?[0-9.]*[0-9]+[0-9.]*)/g;
+const unitsTest = /^-?[0-9.]*[0-9]+[0-9.]*$/g;
+function calculateSize(size, ratio, precision) {
+  if (ratio === 1) {
+    return size;
+  }
+  precision = precision || 100;
+  if (typeof size === "number") {
+    return Math.ceil(size * ratio * precision) / precision;
+  }
+  if (typeof size !== "string") {
+    return size;
+  }
+  const oldParts = size.split(unitsSplit);
+  if (oldParts === null || !oldParts.length) {
+    return size;
+  }
+  const newParts = [];
+  let code = oldParts.shift();
+  let isNumber = unitsTest.test(code);
+  while (true) {
+    if (isNumber) {
+      const num = parseFloat(code);
+      if (isNaN(num)) {
+        newParts.push(code);
+      } else {
+        newParts.push(Math.ceil(num * ratio * precision) / precision);
+      }
+    } else {
+      newParts.push(code);
+    }
+    code = oldParts.shift();
+    if (code === void 0) {
+      return newParts.join("");
+    }
+    isNumber = !isNumber;
+  }
+}
+function iconToSVG(icon, customisations) {
+  const fullIcon = {
+    ...defaultIconProps,
+    ...icon
+  };
+  const fullCustomisations = {
+    ...defaultIconCustomisations,
+    ...customisations
+  };
+  const box = {
+    left: fullIcon.left,
+    top: fullIcon.top,
+    width: fullIcon.width,
+    height: fullIcon.height
+  };
+  let body = fullIcon.body;
+  [fullIcon, fullCustomisations].forEach((props) => {
+    const transformations = [];
+    const hFlip = props.hFlip;
+    const vFlip = props.vFlip;
+    let rotation = props.rotate;
+    if (hFlip) {
+      if (vFlip) {
+        rotation += 2;
+      } else {
+        transformations.push("translate(" + (box.width + box.left).toString() + " " + (0 - box.top).toString() + ")");
+        transformations.push("scale(-1 1)");
+        box.top = box.left = 0;
+      }
+    } else if (vFlip) {
+      transformations.push("translate(" + (0 - box.left).toString() + " " + (box.height + box.top).toString() + ")");
+      transformations.push("scale(1 -1)");
+      box.top = box.left = 0;
+    }
+    let tempValue;
+    if (rotation < 0) {
+      rotation -= Math.floor(rotation / 4) * 4;
+    }
+    rotation = rotation % 4;
+    switch (rotation) {
+      case 1:
+        tempValue = box.height / 2 + box.top;
+        transformations.unshift("rotate(90 " + tempValue.toString() + " " + tempValue.toString() + ")");
+        break;
+      case 2:
+        transformations.unshift("rotate(180 " + (box.width / 2 + box.left).toString() + " " + (box.height / 2 + box.top).toString() + ")");
+        break;
+      case 3:
+        tempValue = box.width / 2 + box.left;
+        transformations.unshift("rotate(-90 " + tempValue.toString() + " " + tempValue.toString() + ")");
+        break;
+    }
+    if (rotation % 2 === 1) {
+      if (box.left !== box.top) {
+        tempValue = box.left;
+        box.left = box.top;
+        box.top = tempValue;
+      }
+      if (box.width !== box.height) {
+        tempValue = box.width;
+        box.width = box.height;
+        box.height = tempValue;
+      }
+    }
+    if (transformations.length) {
+      body = '<g transform="' + transformations.join(" ") + '">' + body + "</g>";
+    }
+  });
+  const customisationsWidth = fullCustomisations.width;
+  const customisationsHeight = fullCustomisations.height;
+  const boxWidth = box.width;
+  const boxHeight = box.height;
+  let width;
+  let height;
+  if (customisationsWidth === null) {
+    height = customisationsHeight === null ? "1em" : customisationsHeight === "auto" ? boxHeight : customisationsHeight;
+    width = calculateSize(height, boxWidth / boxHeight);
+  } else {
+    width = customisationsWidth === "auto" ? boxWidth : customisationsWidth;
+    height = customisationsHeight === null ? calculateSize(width, boxHeight / boxWidth) : customisationsHeight === "auto" ? boxHeight : customisationsHeight;
+  }
+  const result = {
+    attributes: {
+      width: width.toString(),
+      height: height.toString(),
+      viewBox: box.left.toString() + " " + box.top.toString() + " " + boxWidth.toString() + " " + boxHeight.toString()
+    },
+    body
+  };
+  return result;
+}
+const regex = /\sid="(\S+)"/g;
+const randomPrefix = "IconifyId" + Date.now().toString(16) + (Math.random() * 16777216 | 0).toString(16);
+let counter = 0;
+function replaceIDs(body, prefix = randomPrefix) {
+  const ids = [];
+  let match;
+  while (match = regex.exec(body)) {
+    ids.push(match[1]);
+  }
+  if (!ids.length) {
+    return body;
+  }
+  ids.forEach((id) => {
+    const newID = typeof prefix === "function" ? prefix(id) : prefix + (counter++).toString();
+    const escapedID = id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    body = body.replace(new RegExp('([#;"])(' + escapedID + ')([")]|\\.[a-z])', "g"), "$1" + newID + "$3");
+  });
+  return body;
+}
+const storage = /* @__PURE__ */ Object.create(null);
+function setAPIModule(provider, item) {
+  storage[provider] = item;
+}
+function getAPIModule(provider) {
+  return storage[provider] || storage[""];
+}
+function createAPIConfig(source) {
+  let resources;
+  if (typeof source.resources === "string") {
+    resources = [source.resources];
+  } else {
+    resources = source.resources;
+    if (!(resources instanceof Array) || !resources.length) {
+      return null;
+    }
+  }
+  const result = {
+    resources,
+    path: source.path || "/",
+    maxURL: source.maxURL || 500,
+    rotate: source.rotate || 750,
+    timeout: source.timeout || 5e3,
+    random: source.random === true,
+    index: source.index || 0,
+    dataAfterTimeout: source.dataAfterTimeout !== false
+  };
+  return result;
+}
+const configStorage = /* @__PURE__ */ Object.create(null);
+const fallBackAPISources = [
+  "https://api.simplesvg.com",
+  "https://api.unisvg.com"
+];
+const fallBackAPI = [];
+while (fallBackAPISources.length > 0) {
+  if (fallBackAPISources.length === 1) {
+    fallBackAPI.push(fallBackAPISources.shift());
+  } else {
+    if (Math.random() > 0.5) {
+      fallBackAPI.push(fallBackAPISources.shift());
+    } else {
+      fallBackAPI.push(fallBackAPISources.pop());
+    }
+  }
+}
+configStorage[""] = createAPIConfig({
+  resources: ["https://api.iconify.design"].concat(fallBackAPI)
+});
+function addAPIProvider(provider, customConfig) {
+  const config = createAPIConfig(customConfig);
+  if (config === null) {
+    return false;
+  }
+  configStorage[provider] = config;
+  return true;
+}
+function getAPIConfig(provider) {
+  return configStorage[provider];
+}
+const detectFetch = () => {
+  let callback;
+  try {
+    callback = fetch;
+    if (typeof callback === "function") {
+      return callback;
+    }
+  } catch (err) {
+  }
+};
+let fetchModule = detectFetch();
+function calculateMaxLength(provider, prefix) {
+  const config = getAPIConfig(provider);
+  if (!config) {
+    return 0;
+  }
+  let result;
+  if (!config.maxURL) {
+    result = 0;
+  } else {
+    let maxHostLength = 0;
+    config.resources.forEach((item) => {
+      const host = item;
+      maxHostLength = Math.max(maxHostLength, host.length);
+    });
+    const url = prefix + ".json?icons=";
+    result = config.maxURL - maxHostLength - config.path.length - url.length;
+  }
+  return result;
+}
+function shouldAbort(status) {
+  return status === 404;
+}
+const prepare = (provider, prefix, icons) => {
+  const results = [];
+  const maxLength = calculateMaxLength(provider, prefix);
+  const type = "icons";
+  let item = {
+    type,
+    provider,
+    prefix,
+    icons: []
+  };
+  let length = 0;
+  icons.forEach((name, index) => {
+    length += name.length + 1;
+    if (length >= maxLength && index > 0) {
+      results.push(item);
+      item = {
+        type,
+        provider,
+        prefix,
+        icons: []
+      };
+      length = name.length;
+    }
+    item.icons.push(name);
+  });
+  results.push(item);
+  return results;
+};
+function getPath(provider) {
+  if (typeof provider === "string") {
+    const config = getAPIConfig(provider);
+    if (config) {
+      return config.path;
+    }
+  }
+  return "/";
+}
+const send = (host, params, callback) => {
+  if (!fetchModule) {
+    callback("abort", 424);
+    return;
+  }
+  let path = getPath(params.provider);
+  switch (params.type) {
+    case "icons": {
+      const prefix = params.prefix;
+      const icons = params.icons;
+      const iconsList = icons.join(",");
+      const urlParams = new URLSearchParams({
+        icons: iconsList
+      });
+      path += prefix + ".json?" + urlParams.toString();
+      break;
+    }
+    case "custom": {
+      const uri = params.uri;
+      path += uri.slice(0, 1) === "/" ? uri.slice(1) : uri;
+      break;
+    }
+    default:
+      callback("abort", 400);
+      return;
+  }
+  let defaultError = 503;
+  fetchModule(host + path).then((response) => {
+    const status = response.status;
+    if (status !== 200) {
+      setTimeout(() => {
+        callback(shouldAbort(status) ? "abort" : "next", status);
+      });
+      return;
+    }
+    defaultError = 501;
+    return response.json();
+  }).then((data) => {
+    if (typeof data !== "object" || data === null) {
+      setTimeout(() => {
+        callback("next", defaultError);
+      });
+      return;
+    }
+    setTimeout(() => {
+      callback("success", data);
+    });
+  }).catch(() => {
+    callback("next", defaultError);
+  });
+};
+const fetchAPIModule = {
+  prepare,
+  send
+};
+function sortIcons(icons) {
+  const result = {
+    loaded: [],
+    missing: [],
+    pending: []
+  };
+  const storage2 = /* @__PURE__ */ Object.create(null);
+  icons.sort((a, b) => {
+    if (a.provider !== b.provider) {
+      return a.provider.localeCompare(b.provider);
+    }
+    if (a.prefix !== b.prefix) {
+      return a.prefix.localeCompare(b.prefix);
+    }
+    return a.name.localeCompare(b.name);
+  });
+  let lastIcon = {
+    provider: "",
+    prefix: "",
+    name: ""
+  };
+  icons.forEach((icon) => {
+    if (lastIcon.name === icon.name && lastIcon.prefix === icon.prefix && lastIcon.provider === icon.provider) {
+      return;
+    }
+    lastIcon = icon;
+    const provider = icon.provider;
+    const prefix = icon.prefix;
+    const name = icon.name;
+    const providerStorage = storage2[provider] || (storage2[provider] = /* @__PURE__ */ Object.create(null));
+    const localStorage = providerStorage[prefix] || (providerStorage[prefix] = getStorage(provider, prefix));
+    let list;
+    if (name in localStorage.icons) {
+      list = result.loaded;
+    } else if (prefix === "" || localStorage.missing.has(name)) {
+      list = result.missing;
+    } else {
+      list = result.pending;
+    }
+    const item = {
+      provider,
+      prefix,
+      name
+    };
+    list.push(item);
+  });
+  return result;
+}
+function removeCallback(storages, id) {
+  storages.forEach((storage2) => {
+    const items = storage2.loaderCallbacks;
+    if (items) {
+      storage2.loaderCallbacks = items.filter((row) => row.id !== id);
+    }
+  });
+}
+function updateCallbacks(storage2) {
+  if (!storage2.pendingCallbacksFlag) {
+    storage2.pendingCallbacksFlag = true;
+    setTimeout(() => {
+      storage2.pendingCallbacksFlag = false;
+      const items = storage2.loaderCallbacks ? storage2.loaderCallbacks.slice(0) : [];
+      if (!items.length) {
+        return;
+      }
+      let hasPending = false;
+      const provider = storage2.provider;
+      const prefix = storage2.prefix;
+      items.forEach((item) => {
+        const icons = item.icons;
+        const oldLength = icons.pending.length;
+        icons.pending = icons.pending.filter((icon) => {
+          if (icon.prefix !== prefix) {
+            return true;
+          }
+          const name = icon.name;
+          if (storage2.icons[name]) {
+            icons.loaded.push({
+              provider,
+              prefix,
+              name
+            });
+          } else if (storage2.missing.has(name)) {
+            icons.missing.push({
+              provider,
+              prefix,
+              name
+            });
+          } else {
+            hasPending = true;
+            return true;
+          }
+          return false;
+        });
+        if (icons.pending.length !== oldLength) {
+          if (!hasPending) {
+            removeCallback([storage2], item.id);
+          }
+          item.callback(icons.loaded.slice(0), icons.missing.slice(0), icons.pending.slice(0), item.abort);
+        }
+      });
+    });
+  }
+}
+let idCounter = 0;
+function storeCallback(callback, icons, pendingSources) {
+  const id = idCounter++;
+  const abort = removeCallback.bind(null, pendingSources, id);
+  if (!icons.pending.length) {
+    return abort;
+  }
+  const item = {
+    id,
+    icons,
+    callback,
+    abort
+  };
+  pendingSources.forEach((storage2) => {
+    (storage2.loaderCallbacks || (storage2.loaderCallbacks = [])).push(item);
+  });
+  return abort;
+}
+function listToIcons(list, validate = true, simpleNames2 = false) {
+  const result = [];
+  list.forEach((item) => {
+    const icon = typeof item === "string" ? stringToIcon(item, validate, simpleNames2) : item;
+    if (icon) {
+      result.push(icon);
+    }
+  });
+  return result;
+}
+var defaultConfig = {
+  resources: [],
+  index: 0,
+  timeout: 2e3,
+  rotate: 750,
+  random: false,
+  dataAfterTimeout: false
+};
+function sendQuery(config, payload, query, done) {
+  const resourcesCount = config.resources.length;
+  const startIndex = config.random ? Math.floor(Math.random() * resourcesCount) : config.index;
+  let resources;
+  if (config.random) {
+    let list = config.resources.slice(0);
+    resources = [];
+    while (list.length > 1) {
+      const nextIndex = Math.floor(Math.random() * list.length);
+      resources.push(list[nextIndex]);
+      list = list.slice(0, nextIndex).concat(list.slice(nextIndex + 1));
+    }
+    resources = resources.concat(list);
+  } else {
+    resources = config.resources.slice(startIndex).concat(config.resources.slice(0, startIndex));
+  }
+  const startTime = Date.now();
+  let status = "pending";
+  let queriesSent = 0;
+  let lastError;
+  let timer = null;
+  let queue = [];
+  let doneCallbacks = [];
+  if (typeof done === "function") {
+    doneCallbacks.push(done);
+  }
+  function resetTimer() {
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  }
+  function abort() {
+    if (status === "pending") {
+      status = "aborted";
+    }
+    resetTimer();
+    queue.forEach((item) => {
+      if (item.status === "pending") {
+        item.status = "aborted";
+      }
+    });
+    queue = [];
+  }
+  function subscribe(callback, overwrite) {
+    if (overwrite) {
+      doneCallbacks = [];
+    }
+    if (typeof callback === "function") {
+      doneCallbacks.push(callback);
+    }
+  }
+  function getQueryStatus() {
+    return {
+      startTime,
+      payload,
+      status,
+      queriesSent,
+      queriesPending: queue.length,
+      subscribe,
+      abort
+    };
+  }
+  function failQuery() {
+    status = "failed";
+    doneCallbacks.forEach((callback) => {
+      callback(void 0, lastError);
+    });
+  }
+  function clearQueue() {
+    queue.forEach((item) => {
+      if (item.status === "pending") {
+        item.status = "aborted";
+      }
+    });
+    queue = [];
+  }
+  function moduleResponse(item, response, data) {
+    const isError = response !== "success";
+    queue = queue.filter((queued) => queued !== item);
+    switch (status) {
+      case "pending":
+        break;
+      case "failed":
+        if (isError || !config.dataAfterTimeout) {
+          return;
+        }
+        break;
+      default:
+        return;
+    }
+    if (response === "abort") {
+      lastError = data;
+      failQuery();
+      return;
+    }
+    if (isError) {
+      lastError = data;
+      if (!queue.length) {
+        if (!resources.length) {
+          failQuery();
+        } else {
+          execNext();
+        }
+      }
+      return;
+    }
+    resetTimer();
+    clearQueue();
+    if (!config.random) {
+      const index = config.resources.indexOf(item.resource);
+      if (index !== -1 && index !== config.index) {
+        config.index = index;
+      }
+    }
+    status = "completed";
+    doneCallbacks.forEach((callback) => {
+      callback(data);
+    });
+  }
+  function execNext() {
+    if (status !== "pending") {
+      return;
+    }
+    resetTimer();
+    const resource = resources.shift();
+    if (resource === void 0) {
+      if (queue.length) {
+        timer = setTimeout(() => {
+          resetTimer();
+          if (status === "pending") {
+            clearQueue();
+            failQuery();
+          }
+        }, config.timeout);
+        return;
+      }
+      failQuery();
+      return;
+    }
+    const item = {
+      status: "pending",
+      resource,
+      callback: (status2, data) => {
+        moduleResponse(item, status2, data);
+      }
+    };
+    queue.push(item);
+    queriesSent++;
+    timer = setTimeout(execNext, config.rotate);
+    query(resource, payload, item.callback);
+  }
+  setTimeout(execNext);
+  return getQueryStatus;
+}
+function initRedundancy(cfg) {
+  const config = {
+    ...defaultConfig,
+    ...cfg
+  };
+  let queries = [];
+  function cleanup() {
+    queries = queries.filter((item) => item().status === "pending");
+  }
+  function query(payload, queryCallback, doneCallback) {
+    const query2 = sendQuery(config, payload, queryCallback, (data, error) => {
+      cleanup();
+      if (doneCallback) {
+        doneCallback(data, error);
+      }
+    });
+    queries.push(query2);
+    return query2;
+  }
+  function find(callback) {
+    return queries.find((value) => {
+      return callback(value);
+    }) || null;
+  }
+  const instance = {
+    query,
+    find,
+    setIndex: (index) => {
+      config.index = index;
+    },
+    getIndex: () => config.index,
+    cleanup
+  };
+  return instance;
+}
+function emptyCallback$1() {
+}
+const redundancyCache = /* @__PURE__ */ Object.create(null);
+function getRedundancyCache(provider) {
+  if (!redundancyCache[provider]) {
+    const config = getAPIConfig(provider);
+    if (!config) {
+      return;
+    }
+    const redundancy = initRedundancy(config);
+    const cachedReundancy = {
+      config,
+      redundancy
+    };
+    redundancyCache[provider] = cachedReundancy;
+  }
+  return redundancyCache[provider];
+}
+function sendAPIQuery(target, query, callback) {
+  let redundancy;
+  let send2;
+  if (typeof target === "string") {
+    const api = getAPIModule(target);
+    if (!api) {
+      callback(void 0, 424);
+      return emptyCallback$1;
+    }
+    send2 = api.send;
+    const cached = getRedundancyCache(target);
+    if (cached) {
+      redundancy = cached.redundancy;
+    }
+  } else {
+    const config = createAPIConfig(target);
+    if (config) {
+      redundancy = initRedundancy(config);
+      const moduleKey = target.resources ? target.resources[0] : "";
+      const api = getAPIModule(moduleKey);
+      if (api) {
+        send2 = api.send;
+      }
+    }
+  }
+  if (!redundancy || !send2) {
+    callback(void 0, 424);
+    return emptyCallback$1;
+  }
+  return redundancy.query(query, send2, callback)().abort;
+}
+const browserCacheVersion = "iconify2";
+const browserCachePrefix = "iconify";
+const browserCacheCountKey = browserCachePrefix + "-count";
+const browserCacheVersionKey = browserCachePrefix + "-version";
+const browserStorageHour = 36e5;
+const browserStorageCacheExpiration = 168;
+function getStoredItem(func, key) {
+  try {
+    return func.getItem(key);
+  } catch (err) {
+  }
+}
+function setStoredItem(func, key, value) {
+  try {
+    func.setItem(key, value);
+    return true;
+  } catch (err) {
+  }
+}
+function removeStoredItem(func, key) {
+  try {
+    func.removeItem(key);
+  } catch (err) {
+  }
+}
+function setBrowserStorageItemsCount(storage2, value) {
+  return setStoredItem(storage2, browserCacheCountKey, value.toString());
+}
+function getBrowserStorageItemsCount(storage2) {
+  return parseInt(getStoredItem(storage2, browserCacheCountKey)) || 0;
+}
+const browserStorageConfig = {
+  local: true,
+  session: true
+};
+const browserStorageEmptyItems = {
+  local: /* @__PURE__ */ new Set(),
+  session: /* @__PURE__ */ new Set()
+};
+let browserStorageStatus = false;
+function setBrowserStorageStatus(status) {
+  browserStorageStatus = status;
+}
+let _window = typeof window === "undefined" ? {} : window;
+function getBrowserStorage(key) {
+  const attr = key + "Storage";
+  try {
+    if (_window && _window[attr] && typeof _window[attr].length === "number") {
+      return _window[attr];
+    }
+  } catch (err) {
+  }
+  browserStorageConfig[key] = false;
+}
+function iterateBrowserStorage(key, callback) {
+  const func = getBrowserStorage(key);
+  if (!func) {
+    return;
+  }
+  const version = getStoredItem(func, browserCacheVersionKey);
+  if (version !== browserCacheVersion) {
+    if (version) {
+      const total2 = getBrowserStorageItemsCount(func);
+      for (let i = 0; i < total2; i++) {
+        removeStoredItem(func, browserCachePrefix + i.toString());
+      }
+    }
+    setStoredItem(func, browserCacheVersionKey, browserCacheVersion);
+    setBrowserStorageItemsCount(func, 0);
+    return;
+  }
+  const minTime = Math.floor(Date.now() / browserStorageHour) - browserStorageCacheExpiration;
+  const parseItem = (index) => {
+    const name = browserCachePrefix + index.toString();
+    const item = getStoredItem(func, name);
+    if (typeof item !== "string") {
+      return;
+    }
+    try {
+      const data = JSON.parse(item);
+      if (typeof data === "object" && typeof data.cached === "number" && data.cached > minTime && typeof data.provider === "string" && typeof data.data === "object" && typeof data.data.prefix === "string" && callback(data, index)) {
+        return true;
+      }
+    } catch (err) {
+    }
+    removeStoredItem(func, name);
+  };
+  let total = getBrowserStorageItemsCount(func);
+  for (let i = total - 1; i >= 0; i--) {
+    if (!parseItem(i)) {
+      if (i === total - 1) {
+        total--;
+        setBrowserStorageItemsCount(func, total);
+      } else {
+        browserStorageEmptyItems[key].add(i);
+      }
+    }
+  }
+}
+function initBrowserStorage() {
+  if (browserStorageStatus) {
+    return;
+  }
+  setBrowserStorageStatus(true);
+  for (const key in browserStorageConfig) {
+    iterateBrowserStorage(key, (item) => {
+      const iconSet = item.data;
+      const provider = item.provider;
+      const prefix = iconSet.prefix;
+      const storage2 = getStorage(provider, prefix);
+      if (!addIconSet(storage2, iconSet).length) {
+        return false;
+      }
+      const lastModified = iconSet.lastModified || -1;
+      storage2.lastModifiedCached = storage2.lastModifiedCached ? Math.min(storage2.lastModifiedCached, lastModified) : lastModified;
+      return true;
+    });
+  }
+}
+function updateLastModified(storage2, lastModified) {
+  const lastValue = storage2.lastModifiedCached;
+  if (lastValue && lastValue >= lastModified) {
+    return lastValue === lastModified;
+  }
+  storage2.lastModifiedCached = lastModified;
+  if (lastValue) {
+    for (const key in browserStorageConfig) {
+      iterateBrowserStorage(key, (item) => {
+        const iconSet = item.data;
+        return item.provider !== storage2.provider || iconSet.prefix !== storage2.prefix || iconSet.lastModified === lastModified;
+      });
+    }
+  }
+  return true;
+}
+function storeInBrowserStorage(storage2, data) {
+  if (!browserStorageStatus) {
+    initBrowserStorage();
+  }
+  function store(key) {
+    let func;
+    if (!browserStorageConfig[key] || !(func = getBrowserStorage(key))) {
+      return;
+    }
+    const set = browserStorageEmptyItems[key];
+    let index;
+    if (set.size) {
+      set.delete(index = Array.from(set).shift());
+    } else {
+      index = getBrowserStorageItemsCount(func);
+      if (!setBrowserStorageItemsCount(func, index + 1)) {
+        return;
+      }
+    }
+    const item = {
+      cached: Math.floor(Date.now() / browserStorageHour),
+      provider: storage2.provider,
+      data
+    };
+    return setStoredItem(func, browserCachePrefix + index.toString(), JSON.stringify(item));
+  }
+  if (data.lastModified && !updateLastModified(storage2, data.lastModified)) {
+    return;
+  }
+  if (!Object.keys(data.icons).length) {
+    return;
+  }
+  if (data.not_found) {
+    data = Object.assign({}, data);
+    delete data.not_found;
+  }
+  if (!store("local")) {
+    store("session");
+  }
+}
+function emptyCallback() {
+}
+function loadedNewIcons(storage2) {
+  if (!storage2.iconsLoaderFlag) {
+    storage2.iconsLoaderFlag = true;
+    setTimeout(() => {
+      storage2.iconsLoaderFlag = false;
+      updateCallbacks(storage2);
+    });
+  }
+}
+function loadNewIcons(storage2, icons) {
+  if (!storage2.iconsToLoad) {
+    storage2.iconsToLoad = icons;
+  } else {
+    storage2.iconsToLoad = storage2.iconsToLoad.concat(icons).sort();
+  }
+  if (!storage2.iconsQueueFlag) {
+    storage2.iconsQueueFlag = true;
+    setTimeout(() => {
+      storage2.iconsQueueFlag = false;
+      const {provider, prefix} = storage2;
+      const icons2 = storage2.iconsToLoad;
+      delete storage2.iconsToLoad;
+      let api;
+      if (!icons2 || !(api = getAPIModule(provider))) {
+        return;
+      }
+      const params = api.prepare(provider, prefix, icons2);
+      params.forEach((item) => {
+        sendAPIQuery(provider, item, (data, error) => {
+          if (typeof data !== "object") {
+            if (error !== 404) {
+              return;
+            }
+            item.icons.forEach((name) => {
+              storage2.missing.add(name);
+            });
+          } else {
+            try {
+              const parsed = addIconSet(storage2, data);
+              if (!parsed.length) {
+                return;
+              }
+              const pending = storage2.pendingIcons;
+              if (pending) {
+                parsed.forEach((name) => {
+                  pending.delete(name);
+                });
+              }
+              storeInBrowserStorage(storage2, data);
+            } catch (err) {
+              console.error(err);
+            }
+          }
+          loadedNewIcons(storage2);
+        });
+      });
+    });
+  }
+}
+const loadIcons = (icons, callback) => {
+  const cleanedIcons = listToIcons(icons, true, allowSimpleNames());
+  const sortedIcons = sortIcons(cleanedIcons);
+  if (!sortedIcons.pending.length) {
+    let callCallback = true;
+    if (callback) {
+      setTimeout(() => {
+        if (callCallback) {
+          callback(sortedIcons.loaded, sortedIcons.missing, sortedIcons.pending, emptyCallback);
+        }
+      });
+    }
+    return () => {
+      callCallback = false;
+    };
+  }
+  const newIcons = /* @__PURE__ */ Object.create(null);
+  const sources = [];
+  let lastProvider, lastPrefix;
+  sortedIcons.pending.forEach((icon) => {
+    const {provider, prefix} = icon;
+    if (prefix === lastPrefix && provider === lastProvider) {
+      return;
+    }
+    lastProvider = provider;
+    lastPrefix = prefix;
+    sources.push(getStorage(provider, prefix));
+    const providerNewIcons = newIcons[provider] || (newIcons[provider] = /* @__PURE__ */ Object.create(null));
+    if (!providerNewIcons[prefix]) {
+      providerNewIcons[prefix] = [];
+    }
+  });
+  sortedIcons.pending.forEach((icon) => {
+    const {provider, prefix, name} = icon;
+    const storage2 = getStorage(provider, prefix);
+    const pendingQueue = storage2.pendingIcons || (storage2.pendingIcons = /* @__PURE__ */ new Set());
+    if (!pendingQueue.has(name)) {
+      pendingQueue.add(name);
+      newIcons[provider][prefix].push(name);
+    }
+  });
+  sources.forEach((storage2) => {
+    const {provider, prefix} = storage2;
+    if (newIcons[provider][prefix].length) {
+      loadNewIcons(storage2, newIcons[provider][prefix]);
+    }
+  });
+  return callback ? storeCallback(callback, sortedIcons, sources) : emptyCallback;
+};
+function mergeCustomisations(defaults, item) {
+  const result = {
+    ...defaults
+  };
+  for (const key in item) {
+    const value = item[key];
+    const valueType = typeof value;
+    if (key in defaultIconSizeCustomisations) {
+      if (value === null || value && (valueType === "string" || valueType === "number")) {
+        result[key] = value;
+      }
+    } else if (valueType === typeof result[key]) {
+      result[key] = key === "rotate" ? value % 4 : value;
+    }
+  }
+  return result;
+}
+const separator = /[\s,]+/;
+function flipFromString(custom, flip) {
+  flip.split(separator).forEach((str) => {
+    const value = str.trim();
+    switch (value) {
+      case "horizontal":
+        custom.hFlip = true;
+        break;
+      case "vertical":
+        custom.vFlip = true;
+        break;
+    }
+  });
+}
+function rotateFromString(value, defaultValue = 0) {
+  const units = value.replace(/^-?[0-9.]*/, "");
+  function cleanup(value2) {
+    while (value2 < 0) {
+      value2 += 4;
+    }
+    return value2 % 4;
+  }
+  if (units === "") {
+    const num = parseInt(value);
+    return isNaN(num) ? 0 : cleanup(num);
+  } else if (units !== value) {
+    let split = 0;
+    switch (units) {
+      case "%":
+        split = 25;
+        break;
+      case "deg":
+        split = 90;
+    }
+    if (split) {
+      let num = parseFloat(value.slice(0, value.length - units.length));
+      if (isNaN(num)) {
+        return 0;
+      }
+      num = num / split;
+      return num % 1 === 0 ? cleanup(num) : 0;
+    }
+  }
+  return defaultValue;
+}
+function iconToHTML(body, attributes) {
+  let renderAttribsHTML = body.indexOf("xlink:") === -1 ? "" : ' xmlns:xlink="http://www.w3.org/1999/xlink"';
+  for (const attr in attributes) {
+    renderAttribsHTML += " " + attr + '="' + attributes[attr] + '"';
+  }
+  return '<svg xmlns="http://www.w3.org/2000/svg"' + renderAttribsHTML + ">" + body + "</svg>";
+}
+function encodeSVGforURL(svg) {
+  return svg.replace(/"/g, "'").replace(/%/g, "%25").replace(/#/g, "%23").replace(/</g, "%3C").replace(/>/g, "%3E").replace(/\s+/g, " ");
+}
+function svgToURL(svg) {
+  return 'url("data:image/svg+xml,' + encodeSVGforURL(svg) + '")';
+}
+const defaultExtendedIconCustomisations = {
+  ...defaultIconCustomisations,
+  inline: false
+};
+const svgDefaults = {
+  xmlns: "http://www.w3.org/2000/svg",
+  "xmlns:xlink": "http://www.w3.org/1999/xlink",
+  "aria-hidden": true,
+  role: "img"
+};
+const commonProps = {
+  display: "inline-block"
+};
+const monotoneProps = {
+  "background-color": "currentColor"
+};
+const coloredProps = {
+  "background-color": "transparent"
+};
+const propsToAdd = {
+  image: "var(--svg)",
+  repeat: "no-repeat",
+  size: "100% 100%"
+};
+const propsToAddTo = {
+  "-webkit-mask": monotoneProps,
+  mask: monotoneProps,
+  background: coloredProps
+};
+for (const prefix in propsToAddTo) {
+  const list = propsToAddTo[prefix];
+  for (const prop in propsToAdd) {
+    list[prefix + "-" + prop] = propsToAdd[prop];
+  }
+}
+function fixSize(value) {
+  return value + (value.match(/^[-0-9.]+$/) ? "px" : "");
+}
+function render(icon, props) {
+  const customisations = mergeCustomisations(defaultExtendedIconCustomisations, props);
+  const mode = props.mode || "svg";
+  const componentProps = mode === "svg" ? {...svgDefaults} : {};
+  let style = typeof props.style === "string" ? props.style : "";
+  for (let key in props) {
+    const value = props[key];
+    if (value === void 0) {
+      continue;
+    }
+    switch (key) {
+      case "icon":
+      case "style":
+      case "onLoad":
+      case "mode":
+        break;
+      case "inline":
+      case "hFlip":
+      case "vFlip":
+        customisations[key] = value === true || value === "true" || value === 1;
+        break;
+      case "flip":
+        if (typeof value === "string") {
+          flipFromString(customisations, value);
+        }
+        break;
+      case "color":
+        style = style + (style.length > 0 && style.trim().slice(-1) !== ";" ? ";" : "") + "color: " + value + "; ";
+        break;
+      case "rotate":
+        if (typeof value === "string") {
+          customisations[key] = rotateFromString(value);
+        } else if (typeof value === "number") {
+          customisations[key] = value;
+        }
+        break;
+      case "ariaHidden":
+      case "aria-hidden":
+        if (value !== true && value !== "true") {
+          delete componentProps["aria-hidden"];
+        }
+        break;
+      default:
+        if (key.slice(0, 3) === "on:") {
+          break;
+        }
+        if (defaultExtendedIconCustomisations[key] === void 0) {
+          componentProps[key] = value;
+        }
+    }
+  }
+  const item = iconToSVG(icon, customisations);
+  const renderAttribs = item.attributes;
+  if (customisations.inline) {
+    style = "vertical-align: -0.125em; " + style;
+  }
+  if (mode === "svg") {
+    Object.assign(componentProps, renderAttribs);
+    if (style !== "") {
+      componentProps.style = style;
+    }
+    let localCounter = 0;
+    let id = props.id;
+    if (typeof id === "string") {
+      id = id.replace(/-/g, "_");
+    }
+    return {
+      svg: true,
+      attributes: componentProps,
+      body: replaceIDs(item.body, id ? () => id + "ID" + localCounter++ : "iconifySvelte")
+    };
+  }
+  const {body, width, height} = icon;
+  const useMask = mode === "mask" || (mode === "bg" ? false : body.indexOf("currentColor") !== -1);
+  const html = iconToHTML(body, {
+    ...renderAttribs,
+    width: width + "",
+    height: height + ""
+  });
+  const url = svgToURL(html);
+  const styles = {
+    "--svg": url,
+    width: fixSize(renderAttribs.width),
+    height: fixSize(renderAttribs.height),
+    ...commonProps,
+    ...useMask ? monotoneProps : coloredProps
+  };
+  let customStyle = "";
+  for (const key in styles) {
+    customStyle += key + ": " + styles[key] + ";";
+  }
+  componentProps.style = customStyle + style;
+  return {
+    svg: false,
+    attributes: componentProps
+  };
+}
+allowSimpleNames(true);
+setAPIModule("", fetchAPIModule);
+if (typeof document !== "undefined" && typeof window !== "undefined") {
+  initBrowserStorage();
+  const _window2 = window;
+  if (_window2.IconifyPreload !== void 0) {
+    const preload = _window2.IconifyPreload;
+    const err = "Invalid IconifyPreload syntax.";
+    if (typeof preload === "object" && preload !== null) {
+      (preload instanceof Array ? preload : [preload]).forEach((item) => {
+        try {
+          if (typeof item !== "object" || item === null || item instanceof Array || typeof item.icons !== "object" || typeof item.prefix !== "string" || !addCollection(item)) {
+            console.error(err);
+          }
+        } catch (e) {
+          console.error(err);
+        }
+      });
+    }
+  }
+  if (_window2.IconifyProviders !== void 0) {
+    const providers = _window2.IconifyProviders;
+    if (typeof providers === "object" && providers !== null) {
+      for (let key in providers) {
+        const err = "IconifyProviders[" + key + "] is invalid.";
+        try {
+          const value = providers[key];
+          if (typeof value !== "object" || !value || value.resources === void 0) {
+            continue;
+          }
+          if (!addAPIProvider(key, value)) {
+            console.error(err);
+          }
+        } catch (e) {
+          console.error(err);
+        }
+      }
+    }
+  }
+}
+function checkIconState(icon, state, mounted, callback, onload) {
+  function abortLoading() {
+    if (state.loading) {
+      state.loading.abort();
+      state.loading = null;
+    }
+  }
+  if (typeof icon === "object" && icon !== null && typeof icon.body === "string") {
+    state.name = "";
+    abortLoading();
+    return {data: {...defaultIconProps, ...icon}};
+  }
+  let iconName;
+  if (typeof icon !== "string" || (iconName = stringToIcon(icon, false, true)) === null) {
+    abortLoading();
+    return null;
+  }
+  const data = getIconData(iconName);
+  if (!data) {
+    if (mounted && (!state.loading || state.loading.name !== icon)) {
+      abortLoading();
+      state.name = "";
+      state.loading = {
+        name: icon,
+        abort: loadIcons([iconName], callback)
+      };
+    }
+    return null;
+  }
+  abortLoading();
+  if (state.name !== icon) {
+    state.name = icon;
+    if (onload && !state.destroyed) {
+      onload(icon);
+    }
+  }
+  const classes = ["iconify"];
+  if (iconName.prefix !== "") {
+    classes.push("iconify--" + iconName.prefix);
+  }
+  if (iconName.provider !== "") {
+    classes.push("iconify--" + iconName.provider);
+  }
+  return {data, classes};
+}
+function generateIcon(icon, props) {
+  return icon ? render({
+    ...defaultIconProps,
+    ...icon
+  }, props) : null;
+}
+var checkIconState_1 = checkIconState;
+var generateIcon_1 = generateIcon;
+
+/* generated by Svelte v3.50.1 */
+
+function create_if_block(ctx) {
+	let if_block_anchor;
+
+	function select_block_type(ctx, dirty) {
+		if (/*data*/ ctx[0].svg) return create_if_block_1;
+		return create_else_block;
+	}
+
+	let current_block_type = select_block_type(ctx);
+	let if_block = current_block_type(ctx);
+
+	return {
+		c() {
+			if_block.c();
+			if_block_anchor = empty();
+		},
+		l(nodes) {
+			if_block.l(nodes);
+			if_block_anchor = empty();
+		},
+		m(target, anchor) {
+			if_block.m(target, anchor);
+			insert_hydration(target, if_block_anchor, anchor);
+		},
+		p(ctx, dirty) {
+			if (current_block_type === (current_block_type = select_block_type(ctx)) && if_block) {
+				if_block.p(ctx, dirty);
+			} else {
+				if_block.d(1);
+				if_block = current_block_type(ctx);
+
+				if (if_block) {
+					if_block.c();
+					if_block.m(if_block_anchor.parentNode, if_block_anchor);
+				}
+			}
+		},
+		d(detaching) {
+			if_block.d(detaching);
+			if (detaching) detach(if_block_anchor);
+		}
+	};
+}
+
+// (113:1) {:else}
+function create_else_block(ctx) {
+	let span;
+	let span_levels = [/*data*/ ctx[0].attributes];
+	let span_data = {};
+
+	for (let i = 0; i < span_levels.length; i += 1) {
+		span_data = assign(span_data, span_levels[i]);
+	}
+
+	return {
+		c() {
+			span = element("span");
+			this.h();
+		},
+		l(nodes) {
+			span = claim_element(nodes, "SPAN", {});
+			children(span).forEach(detach);
+			this.h();
+		},
+		h() {
+			set_attributes(span, span_data);
+		},
+		m(target, anchor) {
+			insert_hydration(target, span, anchor);
+		},
+		p(ctx, dirty) {
+			set_attributes(span, span_data = get_spread_update(span_levels, [dirty & /*data*/ 1 && /*data*/ ctx[0].attributes]));
+		},
+		d(detaching) {
+			if (detaching) detach(span);
+		}
+	};
+}
+
+// (109:1) {#if data.svg}
+function create_if_block_1(ctx) {
+	let svg;
+	let raw_value = /*data*/ ctx[0].body + "";
+	let svg_levels = [/*data*/ ctx[0].attributes];
+	let svg_data = {};
+
+	for (let i = 0; i < svg_levels.length; i += 1) {
+		svg_data = assign(svg_data, svg_levels[i]);
+	}
+
+	return {
+		c() {
+			svg = svg_element("svg");
+			this.h();
+		},
+		l(nodes) {
+			svg = claim_svg_element(nodes, "svg", {});
+			var svg_nodes = children(svg);
+			svg_nodes.forEach(detach);
+			this.h();
+		},
+		h() {
+			set_svg_attributes(svg, svg_data);
+		},
+		m(target, anchor) {
+			insert_hydration(target, svg, anchor);
+			svg.innerHTML = raw_value;
+		},
+		p(ctx, dirty) {
+			if (dirty & /*data*/ 1 && raw_value !== (raw_value = /*data*/ ctx[0].body + "")) svg.innerHTML = raw_value;			set_svg_attributes(svg, svg_data = get_spread_update(svg_levels, [dirty & /*data*/ 1 && /*data*/ ctx[0].attributes]));
+		},
+		d(detaching) {
+			if (detaching) detach(svg);
+		}
+	};
+}
+
+function create_fragment(ctx) {
+	let if_block_anchor;
+	let if_block = /*data*/ ctx[0] && create_if_block(ctx);
+
+	return {
+		c() {
+			if (if_block) if_block.c();
+			if_block_anchor = empty();
+		},
+		l(nodes) {
+			if (if_block) if_block.l(nodes);
+			if_block_anchor = empty();
+		},
+		m(target, anchor) {
+			if (if_block) if_block.m(target, anchor);
+			insert_hydration(target, if_block_anchor, anchor);
+		},
+		p(ctx, [dirty]) {
+			if (/*data*/ ctx[0]) {
+				if (if_block) {
+					if_block.p(ctx, dirty);
+				} else {
+					if_block = create_if_block(ctx);
+					if_block.c();
+					if_block.m(if_block_anchor.parentNode, if_block_anchor);
+				}
+			} else if (if_block) {
+				if_block.d(1);
+				if_block = null;
+			}
+		},
+		i: noop,
+		o: noop,
+		d(detaching) {
+			if (if_block) if_block.d(detaching);
+			if (detaching) detach(if_block_anchor);
+		}
+	};
+}
+
+function instance($$self, $$props, $$invalidate) {
+	const state = {
+		// Last icon name
+		name: '',
+		// Loading status
+		loading: null,
+		// Destroyed status
+		destroyed: false
+	};
+
+	// Mounted status
+	let mounted = false;
+
+	// Callback counter
+	let counter = 0;
+
+	// Generated data
+	let data;
+
+	const onLoad = icon => {
+		// Legacy onLoad property
+		if (typeof $$props.onLoad === 'function') {
+			$$props.onLoad(icon);
+		}
+
+		// on:load event
+		const dispatch = createEventDispatcher();
+
+		dispatch('load', { icon });
+	};
+
+	// Increase counter when loaded to force re-calculation of data
+	function loaded() {
+		$$invalidate(3, counter++, counter);
+	}
+
+	// Force re-render
+	onMount(() => {
+		$$invalidate(2, mounted = true);
+	});
+
+	// Abort loading when component is destroyed
+	onDestroy(() => {
+		$$invalidate(1, state.destroyed = true, state);
+
+		if (state.loading) {
+			state.loading.abort();
+			$$invalidate(1, state.loading = null, state);
+		}
+	});
+
+	$$self.$$set = $$new_props => {
+		$$invalidate(6, $$props = assign(assign({}, $$props), exclude_internal_props($$new_props)));
+	};
+
+	$$self.$$.update = () => {
+		 {
+			const iconData = checkIconState_1($$props.icon, state, mounted, loaded, onLoad);
+			$$invalidate(0, data = iconData ? generateIcon_1(iconData.data, $$props) : null);
+
+			if (data && iconData.classes) {
+				// Add classes
+				$$invalidate(
+					0,
+					data.attributes['class'] = (typeof $$props['class'] === 'string'
+					? $$props['class'] + ' '
+					: '') + iconData.classes.join(' '),
+					data
+				);
+			}
+		}
+	};
+
+	$$props = exclude_internal_props($$props);
+	return [data, state, mounted, counter];
+}
+
+class Component extends SvelteComponent {
+	constructor(options) {
+		super();
+		init(this, options, instance, create_fragment, safe_not_equal, {});
+	}
+}
+
+function cubicOut(t) {
+    const f = t - 1.0;
+    return f * f * f + 1.0;
+}
+
+function fly(node, { delay = 0, duration = 400, easing = cubicOut, x = 0, y = 0, opacity = 0 } = {}) {
+    const style = getComputedStyle(node);
+    const target_opacity = +style.opacity;
+    const transform = style.transform === 'none' ? '' : style.transform;
+    const od = target_opacity * (1 - opacity);
+    return {
+        delay,
+        duration,
+        easing,
+        css: (t, u) => `
+			transform: ${transform} translate(${(1 - t) * x}px, ${(1 - t) * y}px);
+			opacity: ${target_opacity - (od * u)}`
+    };
+}
+
+/* generated by Svelte v3.50.1 */
+
+function get_each_context(ctx, list, i) {
+	const child_ctx = ctx.slice();
+	child_ctx[23] = list[i];
+	return child_ctx;
+}
+
+function get_each_context_1(ctx, list, i) {
+	const child_ctx = ctx.slice();
+	child_ctx[23] = list[i];
+	child_ctx[26] = list;
+	child_ctx[27] = i;
+	return child_ctx;
+}
+
+function get_each_context_2(ctx, list, i) {
+	const child_ctx = ctx.slice();
+	child_ctx[28] = list[i];
+	return child_ctx;
+}
+
+// (4:2) {:else}
+function create_else_block_1(ctx) {
+	let icon;
+	let current;
+
+	icon = new Component({
+			props: {
+				icon: "fluent:line-horizontal-3-20-filled",
+				height: "32",
+				color: "#00426a"
+			}
+		});
+
+	return {
+		c() {
+			create_component(icon.$$.fragment);
+		},
+		l(nodes) {
+			claim_component(icon.$$.fragment, nodes);
+		},
+		m(target, anchor) {
+			mount_component(icon, target, anchor);
+			current = true;
+		},
+		i(local) {
+			if (current) return;
+			transition_in(icon.$$.fragment, local);
+			current = true;
+		},
+		o(local) {
+			transition_out(icon.$$.fragment, local);
+			current = false;
+		},
+		d(detaching) {
+			destroy_component(icon, detaching);
+		}
+	};
+}
+
+// (2:2) {#if menu}
+function create_if_block_2(ctx) {
+	let icon;
+	let current;
+
+	icon = new Component({
+			props: {
+				icon: "fluent:dismiss-12-regular",
+				height: "32",
+				color: "#00426a"
+			}
+		});
+
+	return {
+		c() {
+			create_component(icon.$$.fragment);
+		},
+		l(nodes) {
+			claim_component(icon.$$.fragment, nodes);
+		},
+		m(target, anchor) {
+			mount_component(icon, target, anchor);
+			current = true;
+		},
+		i(local) {
+			if (current) return;
+			transition_in(icon.$$.fragment, local);
+			current = true;
+		},
+		o(local) {
+			transition_out(icon.$$.fragment, local);
+			current = false;
+		},
+		d(detaching) {
+			destroy_component(icon, detaching);
+		}
+	};
+}
+
+// (9:0) {#if menu}
+function create_if_block$1(ctx) {
+	let div0;
+	let t0;
+	let div1;
+	let a;
+	let svg;
+	let path0;
+	let path1;
+	let path2;
+	let path3;
+	let path4;
+	let path5;
+	let path6;
+	let path7;
+	let t1;
+	let nav_1;
+	let ul;
+	let t2;
+	let div1_transition;
+	let current;
+	let each_value_1 = /*nav*/ ctx[0];
+	let each_blocks_1 = [];
+
+	for (let i = 0; i < each_value_1.length; i += 1) {
+		each_blocks_1[i] = create_each_block_1(get_each_context_1(ctx, each_value_1, i));
+	}
+
+	const out = i => transition_out(each_blocks_1[i], 1, 1, () => {
+		each_blocks_1[i] = null;
+	});
+
+	let each_value = /*cta*/ ctx[2];
+	let each_blocks = [];
+
+	for (let i = 0; i < each_value.length; i += 1) {
+		each_blocks[i] = create_each_block(get_each_context(ctx, each_value, i));
+	}
+
+	return {
+		c() {
+			div0 = element("div");
+			t0 = space();
+			div1 = element("div");
+			a = element("a");
+			svg = svg_element("svg");
+			path0 = svg_element("path");
+			path1 = svg_element("path");
+			path2 = svg_element("path");
+			path3 = svg_element("path");
+			path4 = svg_element("path");
+			path5 = svg_element("path");
+			path6 = svg_element("path");
+			path7 = svg_element("path");
+			t1 = space();
+			nav_1 = element("nav");
+			ul = element("ul");
+
+			for (let i = 0; i < each_blocks_1.length; i += 1) {
+				each_blocks_1[i].c();
+			}
+
+			t2 = space();
+
+			for (let i = 0; i < each_blocks.length; i += 1) {
+				each_blocks[i].c();
+			}
+
+			this.h();
+		},
+		l(nodes) {
+			div0 = claim_element(nodes, "DIV", { class: true });
+			children(div0).forEach(detach);
+			t0 = claim_space(nodes);
+			div1 = claim_element(nodes, "DIV", { id: true, class: true });
+			var div1_nodes = children(div1);
+			a = claim_element(div1_nodes, "A", { class: true, href: true });
+			var a_nodes = children(a);
+
+			svg = claim_svg_element(a_nodes, "svg", {
+				width: true,
+				height: true,
+				version: true,
+				viewBox: true,
+				xmlns: true,
+				class: true
+			});
+
+			var svg_nodes = children(svg);
+			path0 = claim_svg_element(svg_nodes, "path", { transform: true, d: true, class: true });
+			children(path0).forEach(detach);
+			path1 = claim_svg_element(svg_nodes, "path", { transform: true, d: true, class: true });
+			children(path1).forEach(detach);
+
+			path2 = claim_svg_element(svg_nodes, "path", {
+				transform: true,
+				d: true,
+				class: true,
+				"fill-rule": true
+			});
+
+			children(path2).forEach(detach);
+
+			path3 = claim_svg_element(svg_nodes, "path", {
+				transform: true,
+				d: true,
+				class: true,
+				"fill-rule": true
+			});
+
+			children(path3).forEach(detach);
+
+			path4 = claim_svg_element(svg_nodes, "path", {
+				transform: true,
+				d: true,
+				class: true,
+				"fill-rule": true
+			});
+
+			children(path4).forEach(detach);
+
+			path5 = claim_svg_element(svg_nodes, "path", {
+				transform: true,
+				d: true,
+				class: true,
+				"fill-rule": true
+			});
+
+			children(path5).forEach(detach);
+
+			path6 = claim_svg_element(svg_nodes, "path", {
+				transform: true,
+				d: true,
+				class: true,
+				"fill-rule": true
+			});
+
+			children(path6).forEach(detach);
+
+			path7 = claim_svg_element(svg_nodes, "path", {
+				transform: true,
+				d: true,
+				class: true,
+				"fill-rule": true
+			});
+
+			children(path7).forEach(detach);
+			svg_nodes.forEach(detach);
+			a_nodes.forEach(detach);
+			t1 = claim_space(div1_nodes);
+			nav_1 = claim_element(div1_nodes, "NAV", { class: true });
+			var nav_1_nodes = children(nav_1);
+			ul = claim_element(nav_1_nodes, "UL", { class: true });
+			var ul_nodes = children(ul);
+
+			for (let i = 0; i < each_blocks_1.length; i += 1) {
+				each_blocks_1[i].l(ul_nodes);
+			}
+
+			ul_nodes.forEach(detach);
+			t2 = claim_space(nav_1_nodes);
+
+			for (let i = 0; i < each_blocks.length; i += 1) {
+				each_blocks[i].l(nav_1_nodes);
+			}
+
+			nav_1_nodes.forEach(detach);
+			div1_nodes.forEach(detach);
+			this.h();
+		},
+		h() {
+			attr(div0, "class", "backdrop svelte-12obpxp");
+			attr(path0, "transform", "matrix(1 0 0 -1 1 825.9)");
+			attr(path0, "d", "m112.71 102.18 14.745-100.03h-26.337l-1.3991 17.957h-9.2937l-1.3995-17.957h-26.671l13.074 100.03zm-13.68-64.367c-1.2322 11.339-2.5273 25.376-3.9055 42.132-2.5481-19.222-4.1562-33.259-4.8456-42.132zm90.371 64.367v-100.03h-22.556l-13.408 45.483v-45.483h-21.554v100.03h21.554l14.411-45.04v45.04zm17.502 0h37.301l14.808-100.03h-65.162zm14.849-82.198h8.8137c0 1.2855-0.5431 10.896-1.6293 28.896-1.1067 17.978-1.8587 28.284-2.3182 30.919-0.4385-2.6765-1.3782-13.109-2.7777-31.298-1.3991-18.189-2.0885-27.694-2.0885-28.516zm67.439-17.831h-25.814v100.03h25.94c6.412 0 11.445-0.4003 15.079-1.2223 3.655-0.843 6.7042-2.5081 9.148-5.0375 2.4641-2.529 3.9469-5.269 4.511-8.1773 0.5432-2.9299 0.8147-7.4824 0.8147-13.658v-8.5782c0-10.011-1.9633-16.355-5.9315-19.074-3.9472-2.719-9.5865-4.089-16.876-4.089h-6.8712zm8.1454 66.496v8.0932c0 3.3724-0.5222 5.5854-1.5664 6.6391-1.0233 1.0539-3.2165 1.5808-6.579 1.5808v-25.376h1.9007c2.3391 0 3.9472 0.5689 4.8665 1.6861 0.9187 1.1381 1.3782 3.6042 1.3782 7.3768zm28.947 33.532h42.982v-19.98h-17.168v-19.095h16.04v-18.969h-16.04v-22.004h18.922v-19.981h-44.736zm110.84-58.635c0-10.053-0.2299-17.156-0.7101-21.329-0.4595-4.1942-1.9213-8.0091-4.3861-11.466-2.4644-3.4566-5.8059-6.1121-10.004-7.9668-4.1978-1.8547-9.085-2.7822-14.661-2.7822-5.305 0-10.046 0.8853-14.265 2.6345-4.2188 1.7493-7.6233 4.3628-10.171 7.8616-2.5688 3.4985-4.0935 7.3134-4.595 11.423-0.4805 4.1309-0.7308 11.339-0.7308 21.624v17.114c0 10.053 0.2296 17.156 0.7101 21.329 0.4595 4.1941 1.9216 8.009 4.3858 11.466 2.4644 3.4565 5.8062 6.1123 10.004 7.967 4.1981 1.8547 9.0853 2.782 14.662 2.782 5.3048 0 10.046-0.8853 14.264-2.6346 4.2191-1.7492 7.6233-4.3628 10.171-7.8616 2.5691-3.4985 4.0935-7.3134 4.5947-11.423 0.4805-4.1309 0.7311-11.339 0.7311-21.624zm-25.814 32.858c0 4.6366-0.2506 7.6085-0.7518 8.9152-0.5011 1.2856-1.5247 1.9389-3.0702 1.9389-1.3158 0-2.3184-0.5266-3.0285-1.5806-0.6891-1.0326-1.0443-4.1309-1.0443-9.2735v-46.684c0-5.796 0.2299-9.379 0.6894-10.728 0.4595-1.37 1.5248-2.0444 3.1955-2.0444 1.7124 0 2.8196 0.7798 3.2998 2.3394 0.4805 1.5597 0.7101 5.2903 0.7101 11.17zm68.838 5.796h-7.5189v-80.048h-25.814v100.03h59.147v-100.03h-25.814zm95.007-38.654c0-10.053-0.2296-17.156-0.7101-21.329-0.4595-4.1942-1.9213-8.0091-4.3858-11.466-2.4647-3.4566-5.8062-6.1121-10.004-7.9668-4.1981-1.8547-9.0853-2.7822-14.662-2.7822-5.305 0-10.046 0.8853-14.264 2.6345-4.2188 1.7493-7.6232 4.3628-10.171 7.8616-2.5688 3.4985-4.0935 7.3134-4.595 11.423-0.4802 4.1309-0.7308 11.339-0.7308 21.624v17.114c0 10.053 0.2299 17.156 0.7101 21.329 0.4595 4.1941 1.9216 8.009 4.3858 11.466 2.4647 3.4565 5.8062 6.1123 10.004 7.967 4.1981 1.8547 9.0853 2.782 14.662 2.782 5.3051 0 10.046-0.8853 14.265-2.6346 4.219-1.7492 7.6232-4.3628 10.171-7.8616 2.5691-3.4985 4.0935-7.3134 4.595-11.423 0.4802-4.1309 0.7308-11.339 0.7308-21.624zm-25.814 32.858c0 4.6366-0.2506 7.6085-0.7521 8.9152-0.5011 1.2856-1.5247 1.9389-3.0702 1.9389-1.3158 0-2.3181-0.5266-3.0282-1.5806-0.6894-1.0326-1.0443-4.1309-1.0443-9.2735v-46.684c0-5.796 0.2296-9.379 0.6891-10.728 0.4595-1.37 1.5248-2.0444 3.1955-2.0444 1.7127 0 2.8196 0.7798 3.3001 2.3394 0.4802 1.5597 0.7101 5.2903 0.7101 11.17zm90.391 25.776-18.797-63.82v-36.209h-23.809v36.209l-18.17 63.82h23.663c3.655-19.58 5.7645-32.732 6.2864-39.476 1.4834 10.665 3.8642 23.816 7.1847 39.476zm65.684-100.03h-27.193c-2.6524 23.31-4.8872 46.663-6.7039 70.079-1.6501-23.416-3.6343-46.769-5.9525-70.079h-27.193l13.074 100.03h39.035zm63.157 41.394c0-10.053-0.2296-17.156-0.7101-21.329-0.4595-4.1942-1.9213-8.0091-4.3857-11.466-2.4648-3.4566-5.8062-6.1121-10.004-7.9668-4.1981-1.8547-9.0853-2.7822-14.662-2.7822-5.305 0-10.046 0.8853-14.264 2.6345-4.2188 1.7493-7.6232 4.3628-10.171 7.8616-2.5687 3.4985-4.0935 7.3134-4.5949 11.423-0.4802 4.1309-0.7308 11.339-0.7308 21.624v17.114c0 10.053 0.2299 17.156 0.7101 21.329 0.4595 4.1941 1.9216 8.009 4.386 11.466 2.4644 3.4565 5.8059 6.1123 10.004 7.967 4.1979 1.8547 9.0851 2.782 14.661 2.782 5.305 0 10.046-0.8853 14.265-2.6346 4.2188-1.7492 7.6229-4.3628 10.171-7.8616 2.569-3.4985 4.0935-7.3134 4.5949-11.423 0.4802-4.1309 0.7308-11.339 0.7308-21.624zm-25.814 32.858c0 4.6366-0.2506 7.6085-0.752 8.9152-0.5012 1.2856-1.5248 1.9389-3.0702 1.9389-1.3156 0-2.3182-0.5266-3.0283-1.5806-0.6894-1.0326-1.0443-4.1309-1.0443-9.2735v-46.684c0-5.796 0.2297-9.379 0.6892-10.728 0.4594-1.37 1.5247-2.0444 3.1954-2.0444 1.7127 0 2.8197 0.7798 3.3001 2.3394 0.4802 1.5597 0.7101 5.2903 0.7101 11.17zm57.664-54.272h19.695v-19.981h-48.12l16.917 53.618-17.168 46.41h47.994v-19.98h-18.88l10.108-26.62z");
+			attr(path0, "class", "st0 svelte-12obpxp");
+			attr(path1, "transform", "matrix(1 0 0 -1 1 825.9)");
+			attr(path1, "d", "m249.2 476.19 31.92 3.8798c1.0001-8.1598 3.7199-14.4 8.1601-18.72 4.4399-4.32 9.7999-6.48 16.08-6.48 6.7601 0 12.44 2.6002 17.08 7.7601 4.6 5.1599 6.9199 12.12 6.9199 20.92 0 8.28-2.2 14.88-6.6399 19.72-4.4402 4.8399-9.8402 7.28-16.24 7.28-4.2001 0-9.2002-0.8399-15.04-2.4801l3.64 26.72c8.8801-0.2398 15.64 1.72 20.32 5.8402 4.68 4.0799 7.0002 9.5598 7.0002 16.4 0 5.8-1.7201 10.4-5.1602 13.88-3.4398 3.4398-7.9999 5.1599-13.72 5.1599-5.6398 0-10.44-1.9599-14.4-5.8799-3.9999-3.9201-6.3997-9.6401-7.2799-17.16l-30.24 5.1602c2.12 10.48 5.2801 18.84 9.5601 25.12 4.2398 6.2402 10.2 11.16 17.8 14.76 7.6 3.5601 16.16 5.3601 25.6 5.3601 16.16 0 29.12-5.1599 38.88-15.52 8.0402-8.4798 12.08-18.08 12.08-28.76 0-15.12-8.24-27.24-24.76-36.24 9.8399-2.1198 17.68-6.84 23.6-14.2 5.8799-7.3599 8.8398-16.24 8.8398-26.64 0-15.08-5.5199-27.96-16.52-38.6-11-10.64-24.68-15.96-41.08-15.96-15.52 0-28.4 4.4801-38.6 13.48-10.24 8.9601-16.16 20.68-17.8 35.2zm246.04 84.2-31.92-3.52c-0.76 6.5599-2.7998 11.4-6.0798 14.52-3.2802 3.1201-7.52 4.68-12.76 4.68-6.9599 0-12.84-3.1198-17.64-9.36-4.7999-6.2399-7.8001-19.24-9.04-39 8.2001 9.68 18.36 14.52 30.56 14.52 13.72 0 25.52-5.2399 35.32-15.72 9.7999-10.52 14.68-24.04 14.68-40.64 0-17.6-5.1599-31.76-15.48-42.4-10.32-10.64-23.56-15.96-39.72-15.96-17.32 0-31.6 6.76-42.76 20.28-11.16 13.52-16.76 35.64-16.76 66.44 0 31.56 5.8399 54.32 17.48 68.28 11.64 13.96 26.76 20.92 45.36 20.92 13.04 0 23.84-3.68 32.4-11.04 8.5598-7.3202 14-18 16.36-32zm-74.64-71.92c0-10.72 2.48-19 7.3998-24.84 4.9201-5.8403 10.52-8.7602 16.88-8.7602 6.0801 0 11.16 2.4001 15.24 7.16 4.04 4.8002 6.0798 12.64 6.0798 23.52 0 11.2-2.2 19.4-6.56 24.64-4.3999 5.2001-9.8399 7.8001-16.4 7.8001-6.3601 0-11.68-2.4801-16.08-7.4801-4.36-4.9601-6.5599-12.32-6.5599-22.04zm97-13.72 32.88 3.3999c0.9598-7.4401 3.7199-13.36 8.32-17.72 4.64-4.3599 9.9601-6.5199 16-6.5199 6.8799 0 12.72 2.7997 17.48 8.4398s7.16 14.12 7.16 25.44c0 10.64-2.3601 18.6-7.12 23.92-4.72 5.3201-10.88 7.96-18.48 7.96-9.4802 0-18-4.1599-25.52-12.48l-26.64 3.8398 16.8 89.28h87.12v-30.72h-62.12l-5.2002-29.24c7.3202 3.64 14.84 5.48 22.52 5.48 14.64 0 27.04-5.3201 37.2-16 10.2-10.64 15.28-24.48 15.28-41.52 0-14.2-4.1201-26.84-12.32-38-11.2-15.2-26.72-22.8-46.56-22.8-15.88 0-28.84 4.28-38.84 12.8-10.04 8.5601-16 20-17.96 34.44");
+			attr(path1, "class", "st0 svelte-12obpxp");
+			attr(path2, "transform", "matrix(1 0 0 -1 1 825.9)");
+			attr(path2, "d", "m473.53 824.69-67.383 0.2154-78.693-209.44h64.224z");
+			attr(path2, "class", "st1 svelte-12obpxp");
+			attr(path2, "fill-rule", "evenodd");
+			attr(path3, "transform", "matrix(1 0 0 -1 1 825.9)");
+			attr(path3, "d", "m442.35 745 45.355-129.54h66.571l-80.75 209.23z");
+			attr(path3, "class", "st2 svelte-12obpxp");
+			attr(path3, "fill-rule", "evenodd");
+			attr(path4, "transform", "matrix(1 0 0 -1 1 825.9)");
+			attr(path4, "d", "m613.96 276.11 71.739-0.1599-53.908 140.99-70.829-0.0091z");
+			attr(path4, "class", "st2 svelte-12obpxp");
+			attr(path4, "fill-rule", "evenodd");
+			attr(path5, "transform", "matrix(1 0 0 -1 1 825.9)");
+			attr(path5, "d", "m196.79 275.94 71.758 0.011 50.369 140.94-69.126 0.0448z");
+			attr(path5, "class", "st2 svelte-12obpxp");
+			attr(path5, "fill-rule", "evenodd");
+			attr(path6, "transform", "matrix(1 0 0 -1 1 825.9)");
+			attr(path6, "d", "m409.52 329.03c3.8069 2.7777 17.146 19.331 40.66 16.649-5.6036-2.7672-16.54-1.9403-30.682-14.973-6.1075-5.6282-14.625-21.432-15.977-29.68 4.7243 8.4396 8.2477 13.772 16.713 17.944 14.741 7.4897 57.458 8.3321 61.268 46.948 30.393-23.379 25.561-86.357-24.872-100.34-14.663-4.0666-20.52-2.6904-31.199-0.3515l-10.884-7.9988c6.7932-3.4974 20.368-5.2691 27.722-5.2909 45.866-0.1363 81.276 45.126 66.882 91.895-3.8914 12.644-16.212 31.795-29.625 37.432l1.1083-9.2963c-0.9283 6.8446-3.8797 12.953-6.3164 16.138-9.4921-16.961-8.979-17.308-37.857-24.36-18.413-4.496-29.244-13.979-26.942-34.712zm-3.8826-76.566c5.9199 11.509 1.1013 16.268 40.234 25.869 20.567 5.0457 31.937 15.319 30.22 37.437-3.204-3.8817-21.954-22.929-45.743-17.571 2.4525 1.215 17.559 0.9814 34.16 15.497 5.9661 5.2164 17.788 24.159 17.045 31.743-1.8697-3.598-4.8892-11.438-17.485-18.302-15.526-8.4619-29.805-4.1414-51.838-22.162-10.201-8.3427-11.014-19.044-12.788-24.327-8.8905 5.8878-16.62 27.892-17.182 38.29-0.8212 15.188 3.4872 28.399 12.555 40.452 12.43 16.524 38.062 29.561 65.98 20.588l7.2703 8.1615c-6.2858 4.8617-20.782 5.8955-28.84 5.8459-58.143-0.358-93.872-74.705-48.736-120.82 2.2865-2.3357 8.2681-6.8133 9.3121-8.6879 2.8891-3.4798 4.3915-5.7781 5.8346-12.016");
+			attr(path6, "class", "st1 svelte-12obpxp");
+			attr(path6, "fill-rule", "evenodd");
+			attr(path7, "transform", "matrix(1 0 0 -1 1 825.9)");
+			attr(path7, "d", "m232.44 505.61-8.9649 58.574-217.83 59.321c-11.121 0.8691-9.4277-54.956 38.713-68.435zm417.6 0 8.9649 58.574 217.83 59.321c11.121 0.8691 9.4277-54.956-38.713-68.435zm196.44 21.673c11.183-23.192-10.412-57.574-33.013-63.879l-160.01-44.645c-8.2738-2.4091-8.2945-4.7724-11.523 3.8821l-7.2017 20.603 6.1911 25.025c1.9123 7.4239 6.2323 6.472 12.66 8.3395zm-191.05-137.46 155.49 42.87c6.7597-5.673 2.5438-24.015 0.2298-31.652-4.6233-15.257-14.691-29.086-29.875-33.34l-100.74-28.224c-6.9712-1.9814-6.7263 2.043-9.286 8.4657zm-55.185-100.88c6.9956-14.929 6.5219-11.021-19.478-40.522l-134.94-109.24c-4.6681-3.7792-5.1098-3.3112-9.5469 0.2806l-134.57 108.95c-26 29.5-26.474 25.593-19.478 40.522 8.2381 0.1239 44.732-11.002 54.939-14.06 12.442-3.7275 14.947-1.5599 24.264-11.736l57.499-48.5c18.148-14.239 25.252-15.184 44.605 0l57.499 48.5c9.3172 10.176 11.822 8.0085 24.264 11.736 10.208 3.058 46.701 14.184 54.939 14.06zm-8.8081 26.311-29.021-7.1396 20.086 29.743zm125.81 380.69-1.6325-86.254c-5.0329-2.2374-50.804-14.888-53.813-14.372l1.7008 49.023-119.21 28.042-25.041 64.561c20.398-10.356 68.366-25.045 91.011-28.989 24.649-4.2933 60.111-14.674 106.99-12.011zm-681.25-168.66c-11.183-23.192 10.412-57.574 33.013-63.879l160.01-44.645c8.2738-2.4091 8.2945-4.7724 11.523 3.8821l7.2017 20.603-6.1912 25.025c-1.9122 7.4239-6.2322 6.472-12.66 8.3395zm191.05-137.46-155.49 42.87c-6.7598-5.673-2.5438-24.015-0.2299-31.652 4.6233-15.257 14.691-29.086 29.875-33.34l100.74-28.224c6.9713-1.9814 6.7263 2.043 9.286 8.4657zm63.994-74.571 29.021-7.1396-20.086 29.743zm-125.81 380.69 1.6325-86.254c5.0329-2.2374 50.804-14.888 53.813-14.372l-1.7008 49.023 119.21 28.042 25.041 64.561c-20.398-10.356-68.366-25.045-91.011-28.989-24.649-4.2933-60.111-14.674-106.99-12.011");
+			attr(path7, "class", "st0 svelte-12obpxp");
+			attr(path7, "fill-rule", "evenodd");
+			attr(svg, "width", "200");
+			attr(svg, "height", "200");
+			attr(svg, "version", "1.1");
+			attr(svg, "viewBox", "0 0 884.48 826.9");
+			attr(svg, "xmlns", "http://www.w3.org/2000/svg");
+			attr(svg, "class", "svelte-12obpxp");
+			attr(a, "class", "logo svelte-12obpxp");
+			attr(a, "href", "/");
+			attr(ul, "class", "svelte-12obpxp");
+			attr(nav_1, "class", "svelte-12obpxp");
+			attr(div1, "id", "menu");
+			attr(div1, "class", "svelte-12obpxp");
+		},
+		m(target, anchor) {
+			insert_hydration(target, div0, anchor);
+			insert_hydration(target, t0, anchor);
+			insert_hydration(target, div1, anchor);
+			append_hydration(div1, a);
+			append_hydration(a, svg);
+			append_hydration(svg, path0);
+			append_hydration(svg, path1);
+			append_hydration(svg, path2);
+			append_hydration(svg, path3);
+			append_hydration(svg, path4);
+			append_hydration(svg, path5);
+			append_hydration(svg, path6);
+			append_hydration(svg, path7);
+			append_hydration(div1, t1);
+			append_hydration(div1, nav_1);
+			append_hydration(nav_1, ul);
+
+			for (let i = 0; i < each_blocks_1.length; i += 1) {
+				each_blocks_1[i].m(ul, null);
+			}
+
+			append_hydration(nav_1, t2);
+
+			for (let i = 0; i < each_blocks.length; i += 1) {
+				each_blocks[i].m(nav_1, null);
+			}
+
+			current = true;
+		},
+		p(ctx, dirty) {
+			if (dirty & /*nav*/ 1) {
+				each_value_1 = /*nav*/ ctx[0];
+				let i;
+
+				for (i = 0; i < each_value_1.length; i += 1) {
+					const child_ctx = get_each_context_1(ctx, each_value_1, i);
+
+					if (each_blocks_1[i]) {
+						each_blocks_1[i].p(child_ctx, dirty);
+						transition_in(each_blocks_1[i], 1);
+					} else {
+						each_blocks_1[i] = create_each_block_1(child_ctx);
+						each_blocks_1[i].c();
+						transition_in(each_blocks_1[i], 1);
+						each_blocks_1[i].m(ul, null);
+					}
+				}
+
+				group_outros();
+
+				for (i = each_value_1.length; i < each_blocks_1.length; i += 1) {
+					out(i);
+				}
+
+				check_outros();
+			}
+
+			if (dirty & /*cta*/ 4) {
+				each_value = /*cta*/ ctx[2];
+				let i;
+
+				for (i = 0; i < each_value.length; i += 1) {
+					const child_ctx = get_each_context(ctx, each_value, i);
+
+					if (each_blocks[i]) {
+						each_blocks[i].p(child_ctx, dirty);
+					} else {
+						each_blocks[i] = create_each_block(child_ctx);
+						each_blocks[i].c();
+						each_blocks[i].m(nav_1, null);
+					}
+				}
+
+				for (; i < each_blocks.length; i += 1) {
+					each_blocks[i].d(1);
+				}
+
+				each_blocks.length = each_value.length;
+			}
+		},
+		i(local) {
+			if (current) return;
+
+			for (let i = 0; i < each_value_1.length; i += 1) {
+				transition_in(each_blocks_1[i]);
+			}
+
+			add_render_callback(() => {
+				if (!div1_transition) div1_transition = create_bidirectional_transition(div1, fly, { x: -300 }, true);
+				div1_transition.run(1);
+			});
+
+			current = true;
+		},
+		o(local) {
+			each_blocks_1 = each_blocks_1.filter(Boolean);
+
+			for (let i = 0; i < each_blocks_1.length; i += 1) {
+				transition_out(each_blocks_1[i]);
+			}
+
+			if (!div1_transition) div1_transition = create_bidirectional_transition(div1, fly, { x: -300 }, false);
+			div1_transition.run(0);
+			current = false;
+		},
+		d(detaching) {
+			if (detaching) detach(div0);
+			if (detaching) detach(t0);
+			if (detaching) detach(div1);
+			destroy_each(each_blocks_1, detaching);
+			destroy_each(each_blocks, detaching);
+			if (detaching && div1_transition) div1_transition.end();
+		}
+	};
+}
+
+// (39:10) {:else}
+function create_else_block$1(ctx) {
+	let a;
+	let t_value = /*item*/ ctx[23].link.label + "";
+	let t;
+	let a_href_value;
+
+	return {
+		c() {
+			a = element("a");
+			t = text(t_value);
+			this.h();
+		},
+		l(nodes) {
+			a = claim_element(nodes, "A", { href: true, class: true });
+			var a_nodes = children(a);
+			t = claim_text(a_nodes, t_value);
+			a_nodes.forEach(detach);
+			this.h();
+		},
+		h() {
+			attr(a, "href", a_href_value = /*item*/ ctx[23].link.url);
+			attr(a, "class", "link");
+		},
+		m(target, anchor) {
+			insert_hydration(target, a, anchor);
+			append_hydration(a, t);
+		},
+		p(ctx, dirty) {
+			if (dirty & /*nav*/ 1 && t_value !== (t_value = /*item*/ ctx[23].link.label + "")) set_data(t, t_value);
+
+			if (dirty & /*nav*/ 1 && a_href_value !== (a_href_value = /*item*/ ctx[23].link.url)) {
+				attr(a, "href", a_href_value);
+			}
+		},
+		i: noop,
+		o: noop,
+		d(detaching) {
+			if (detaching) detach(a);
+		}
+	};
+}
+
+// (28:10) {#if item.submenu && item.submenu.length}
+function create_if_block_1$1(ctx) {
+	let a;
+	let t0_value = /*item*/ ctx[23].link.label + "";
+	let t0;
+	let t1;
+	let span;
+	let icon;
+	let t2;
+	let ul;
+	let current;
+	let mounted;
+	let dispose;
+
+	function click_handler_1() {
+		return /*click_handler_1*/ ctx[22](/*item*/ ctx[23], /*each_value_1*/ ctx[26], /*item_index_1*/ ctx[27]);
+	}
+
+	icon = new Component({
+			props: {
+				icon: /*item*/ ctx[23].open
+				? 'fluent:caret-down-24-filled'
+				: 'fluent:caret-right-24-filled'
+			}
+		});
+
+	let each_value_2 = /*item*/ ctx[23].submenu;
+	let each_blocks = [];
+
+	for (let i = 0; i < each_value_2.length; i += 1) {
+		each_blocks[i] = create_each_block_2(get_each_context_2(ctx, each_value_2, i));
+	}
+
+	return {
+		c() {
+			a = element("a");
+			t0 = text(t0_value);
+			t1 = space();
+			span = element("span");
+			create_component(icon.$$.fragment);
+			t2 = space();
+			ul = element("ul");
+
+			for (let i = 0; i < each_blocks.length; i += 1) {
+				each_blocks[i].c();
+			}
+
+			this.h();
+		},
+		l(nodes) {
+			a = claim_element(nodes, "A", { href: true, class: true });
+			var a_nodes = children(a);
+			t0 = claim_text(a_nodes, t0_value);
+			a_nodes.forEach(detach);
+			t1 = claim_space(nodes);
+			span = claim_element(nodes, "SPAN", { class: true });
+			var span_nodes = children(span);
+			claim_component(icon.$$.fragment, span_nodes);
+			span_nodes.forEach(detach);
+			t2 = claim_space(nodes);
+			ul = claim_element(nodes, "UL", { class: true });
+			var ul_nodes = children(ul);
+
+			for (let i = 0; i < each_blocks.length; i += 1) {
+				each_blocks[i].l(ul_nodes);
+			}
+
+			ul_nodes.forEach(detach);
+			this.h();
+		},
+		h() {
+			attr(a, "href", "#");
+			attr(a, "class", "link");
+			attr(span, "class", "svelte-12obpxp");
+			attr(ul, "class", "svelte-12obpxp");
+			toggle_class(ul, "open", /*item*/ ctx[23].open);
+		},
+		m(target, anchor) {
+			insert_hydration(target, a, anchor);
+			append_hydration(a, t0);
+			insert_hydration(target, t1, anchor);
+			insert_hydration(target, span, anchor);
+			mount_component(icon, span, null);
+			insert_hydration(target, t2, anchor);
+			insert_hydration(target, ul, anchor);
+
+			for (let i = 0; i < each_blocks.length; i += 1) {
+				each_blocks[i].m(ul, null);
+			}
+
+			current = true;
+
+			if (!mounted) {
+				dispose = listen(a, "click", prevent_default(click_handler_1));
+				mounted = true;
+			}
+		},
+		p(new_ctx, dirty) {
+			ctx = new_ctx;
+			if ((!current || dirty & /*nav*/ 1) && t0_value !== (t0_value = /*item*/ ctx[23].link.label + "")) set_data(t0, t0_value);
+			const icon_changes = {};
+
+			if (dirty & /*nav*/ 1) icon_changes.icon = /*item*/ ctx[23].open
+			? 'fluent:caret-down-24-filled'
+			: 'fluent:caret-right-24-filled';
+
+			icon.$set(icon_changes);
+
+			if (dirty & /*nav*/ 1) {
+				each_value_2 = /*item*/ ctx[23].submenu;
+				let i;
+
+				for (i = 0; i < each_value_2.length; i += 1) {
+					const child_ctx = get_each_context_2(ctx, each_value_2, i);
+
+					if (each_blocks[i]) {
+						each_blocks[i].p(child_ctx, dirty);
+					} else {
+						each_blocks[i] = create_each_block_2(child_ctx);
+						each_blocks[i].c();
+						each_blocks[i].m(ul, null);
+					}
+				}
+
+				for (; i < each_blocks.length; i += 1) {
+					each_blocks[i].d(1);
+				}
+
+				each_blocks.length = each_value_2.length;
+			}
+
+			if (!current || dirty & /*nav*/ 1) {
+				toggle_class(ul, "open", /*item*/ ctx[23].open);
+			}
+		},
+		i(local) {
+			if (current) return;
+			transition_in(icon.$$.fragment, local);
+			current = true;
+		},
+		o(local) {
+			transition_out(icon.$$.fragment, local);
+			current = false;
+		},
+		d(detaching) {
+			if (detaching) detach(a);
+			if (detaching) detach(t1);
+			if (detaching) detach(span);
+			destroy_component(icon);
+			if (detaching) detach(t2);
+			if (detaching) detach(ul);
+			destroy_each(each_blocks, detaching);
+			mounted = false;
+			dispose();
+		}
+	};
+}
+
+// (33:10) {#each item.submenu as subitem}
+function create_each_block_2(ctx) {
+	let li;
+	let a;
+	let t0_value = /*subitem*/ ctx[28].sublink.label + "";
+	let t0;
+	let a_href_value;
+	let t1;
+
+	return {
+		c() {
+			li = element("li");
+			a = element("a");
+			t0 = text(t0_value);
+			t1 = space();
+			this.h();
+		},
+		l(nodes) {
+			li = claim_element(nodes, "LI", { class: true });
+			var li_nodes = children(li);
+			a = claim_element(li_nodes, "A", { href: true, class: true });
+			var a_nodes = children(a);
+			t0 = claim_text(a_nodes, t0_value);
+			a_nodes.forEach(detach);
+			t1 = claim_space(li_nodes);
+			li_nodes.forEach(detach);
+			this.h();
+		},
+		h() {
+			attr(a, "href", a_href_value = /*subitem*/ ctx[28].sublink.url);
+			attr(a, "class", "sublink");
+			attr(li, "class", "svelte-12obpxp");
+		},
+		m(target, anchor) {
+			insert_hydration(target, li, anchor);
+			append_hydration(li, a);
+			append_hydration(a, t0);
+			append_hydration(li, t1);
+		},
+		p(ctx, dirty) {
+			if (dirty & /*nav*/ 1 && t0_value !== (t0_value = /*subitem*/ ctx[28].sublink.label + "")) set_data(t0, t0_value);
+
+			if (dirty & /*nav*/ 1 && a_href_value !== (a_href_value = /*subitem*/ ctx[28].sublink.url)) {
+				attr(a, "href", a_href_value);
+			}
+		},
+		d(detaching) {
+			if (detaching) detach(li);
+		}
+	};
+}
+
+// (26:6) {#each nav as item}
+function create_each_block_1(ctx) {
+	let li;
+	let current_block_type_index;
+	let if_block;
+	let t;
+	let current;
+	const if_block_creators = [create_if_block_1$1, create_else_block$1];
+	const if_blocks = [];
+
+	function select_block_type_1(ctx, dirty) {
+		if (/*item*/ ctx[23].submenu && /*item*/ ctx[23].submenu.length) return 0;
+		return 1;
+	}
+
+	current_block_type_index = select_block_type_1(ctx);
+	if_block = if_blocks[current_block_type_index] = if_block_creators[current_block_type_index](ctx);
+
+	return {
+		c() {
+			li = element("li");
+			if_block.c();
+			t = space();
+			this.h();
+		},
+		l(nodes) {
+			li = claim_element(nodes, "LI", { class: true });
+			var li_nodes = children(li);
+			if_block.l(li_nodes);
+			t = claim_space(li_nodes);
+			li_nodes.forEach(detach);
+			this.h();
+		},
+		h() {
+			attr(li, "class", "svelte-12obpxp");
+		},
+		m(target, anchor) {
+			insert_hydration(target, li, anchor);
+			if_blocks[current_block_type_index].m(li, null);
+			append_hydration(li, t);
+			current = true;
+		},
+		p(ctx, dirty) {
+			let previous_block_index = current_block_type_index;
+			current_block_type_index = select_block_type_1(ctx);
+
+			if (current_block_type_index === previous_block_index) {
+				if_blocks[current_block_type_index].p(ctx, dirty);
+			} else {
+				group_outros();
+
+				transition_out(if_blocks[previous_block_index], 1, 1, () => {
+					if_blocks[previous_block_index] = null;
+				});
+
+				check_outros();
+				if_block = if_blocks[current_block_type_index];
+
+				if (!if_block) {
+					if_block = if_blocks[current_block_type_index] = if_block_creators[current_block_type_index](ctx);
+					if_block.c();
+				} else {
+					if_block.p(ctx, dirty);
+				}
+
+				transition_in(if_block, 1);
+				if_block.m(li, t);
+			}
+		},
+		i(local) {
+			if (current) return;
+			transition_in(if_block);
+			current = true;
+		},
+		o(local) {
+			transition_out(if_block);
+			current = false;
+		},
+		d(detaching) {
+			if (detaching) detach(li);
+			if_blocks[current_block_type_index].d();
+		}
+	};
+}
+
+// (45:6) {#each cta as item}
+function create_each_block(ctx) {
+	let a;
+	let t_value = /*item*/ ctx[23].link.label + "";
+	let t;
+	let a_href_value;
+
+	return {
+		c() {
+			a = element("a");
+			t = text(t_value);
+			this.h();
+		},
+		l(nodes) {
+			a = claim_element(nodes, "A", { href: true, class: true });
+			var a_nodes = children(a);
+			t = claim_text(a_nodes, t_value);
+			a_nodes.forEach(detach);
+			this.h();
+		},
+		h() {
+			attr(a, "href", a_href_value = /*item*/ ctx[23].link.url);
+			attr(a, "class", "button svelte-12obpxp");
+		},
+		m(target, anchor) {
+			insert_hydration(target, a, anchor);
+			append_hydration(a, t);
+		},
+		p(ctx, dirty) {
+			if (dirty & /*cta*/ 4 && t_value !== (t_value = /*item*/ ctx[23].link.label + "")) set_data(t, t_value);
+
+			if (dirty & /*cta*/ 4 && a_href_value !== (a_href_value = /*item*/ ctx[23].link.url)) {
+				attr(a, "href", a_href_value);
+			}
+		},
+		d(detaching) {
+			if (detaching) detach(a);
+		}
+	};
+}
+
+function create_fragment$1(ctx) {
+	let button;
+	let current_block_type_index;
+	let if_block0;
+	let t0;
+	let t1;
+	let div8;
+	let div2;
+	let div0;
+	let t2;
+	let t3;
+	let div1;
+	let a0;
+	let icon0;
+	let span0;
+	let t4;
+	let a0_href_value;
+	let t5;
+	let a1;
+	let icon1;
+	let span1;
+	let t6;
+	let a1_href_value;
+	let t7;
+	let div5;
+	let div3;
+	let svg;
+	let path0;
+	let path1;
+	let path2;
+	let path3;
+	let path4;
+	let path5;
+	let path6;
+	let path7;
+	let t8;
+	let div4;
+	let form;
+	let p;
+	let t9;
+	let t10;
+	let input0;
+	let t11;
+	let input1;
+	let t12;
+	let input2;
+	let t13;
+	let input3;
+	let t14;
+	let label;
+	let input4;
+	let t15;
+	let a2;
+	let t16;
+	let t17;
+	let input5;
+	let t18;
+	let div7;
+	let div6;
+	let current;
+	let mounted;
+	let dispose;
+	const if_block_creators = [create_if_block_2, create_else_block_1];
+	const if_blocks = [];
+
+	function select_block_type(ctx, dirty) {
+		if (/*menu*/ ctx[5]) return 0;
+		return 1;
+	}
+
+	current_block_type_index = select_block_type(ctx);
+	if_block0 = if_blocks[current_block_type_index] = if_block_creators[current_block_type_index](ctx);
+	let if_block1 = /*menu*/ ctx[5] && create_if_block$1(ctx);
+
+	icon0 = new Component({
+			props: { icon: "fluent:phone-24-filled" }
+		});
+
+	icon1 = new Component({
+			props: { icon: "fluent:phone-28-filled" }
+		});
+
+	return {
+		c() {
+			button = element("button");
+			if_block0.c();
+			t0 = space();
+			if (if_block1) if_block1.c();
+			t1 = space();
+			div8 = element("div");
+			div2 = element("div");
+			div0 = element("div");
+			t2 = text("Τηλέφωνα Καθημερινά 8:00 - 21:00");
+			t3 = space();
+			div1 = element("div");
+			a0 = element("a");
+			create_component(icon0.$$.fragment);
+			span0 = element("span");
+			t4 = text(/*mobile*/ ctx[3]);
+			t5 = space();
+			a1 = element("a");
+			create_component(icon1.$$.fragment);
+			span1 = element("span");
+			t6 = text(/*phone*/ ctx[1]);
+			t7 = space();
+			div5 = element("div");
+			div3 = element("div");
+			svg = svg_element("svg");
+			path0 = svg_element("path");
+			path1 = svg_element("path");
+			path2 = svg_element("path");
+			path3 = svg_element("path");
+			path4 = svg_element("path");
+			path5 = svg_element("path");
+			path6 = svg_element("path");
+			path7 = svg_element("path");
+			t8 = space();
+			div4 = element("div");
+			form = element("form");
+			p = element("p");
+			t9 = text("Συμπληρώστε τη φόρμα κι ένας εκπρόσωπος μας θα επικοινωνήσει μαζί σας σύντομα");
+			t10 = space();
+			input0 = element("input");
+			t11 = space();
+			input1 = element("input");
+			t12 = space();
+			input2 = element("input");
+			t13 = space();
+			input3 = element("input");
+			t14 = space();
+			label = element("label");
+			input4 = element("input");
+			t15 = text(" Αποδέχομαι τους ");
+			a2 = element("a");
+			t16 = text("όρους χρήσης");
+			t17 = space();
+			input5 = element("input");
+			t18 = space();
+			div7 = element("div");
+			div6 = element("div");
+			this.h();
+		},
+		l(nodes) {
+			button = claim_element(nodes, "BUTTON", { id: true, title: true, class: true });
+			var button_nodes = children(button);
+			if_block0.l(button_nodes);
+			button_nodes.forEach(detach);
+			t0 = claim_space(nodes);
+			if (if_block1) if_block1.l(nodes);
+			t1 = claim_space(nodes);
+			div8 = claim_element(nodes, "DIV", { class: true });
+			var div8_nodes = children(div8);
+			div2 = claim_element(div8_nodes, "DIV", { class: true });
+			var div2_nodes = children(div2);
+			div0 = claim_element(div2_nodes, "DIV", { class: true });
+			var div0_nodes = children(div0);
+			t2 = claim_text(div0_nodes, "Τηλέφωνα Καθημερινά 8:00 - 21:00");
+			div0_nodes.forEach(detach);
+			t3 = claim_space(div2_nodes);
+			div1 = claim_element(div2_nodes, "DIV", { class: true });
+			var div1_nodes = children(div1);
+			a0 = claim_element(div1_nodes, "A", { href: true, class: true });
+			var a0_nodes = children(a0);
+			claim_component(icon0.$$.fragment, a0_nodes);
+			span0 = claim_element(a0_nodes, "SPAN", { class: true });
+			var span0_nodes = children(span0);
+			t4 = claim_text(span0_nodes, /*mobile*/ ctx[3]);
+			span0_nodes.forEach(detach);
+			a0_nodes.forEach(detach);
+			t5 = claim_space(div1_nodes);
+			a1 = claim_element(div1_nodes, "A", { href: true, class: true });
+			var a1_nodes = children(a1);
+			claim_component(icon1.$$.fragment, a1_nodes);
+			span1 = claim_element(a1_nodes, "SPAN", { class: true });
+			var span1_nodes = children(span1);
+			t6 = claim_text(span1_nodes, /*phone*/ ctx[1]);
+			span1_nodes.forEach(detach);
+			a1_nodes.forEach(detach);
+			div1_nodes.forEach(detach);
+			div2_nodes.forEach(detach);
+			t7 = claim_space(div8_nodes);
+			div5 = claim_element(div8_nodes, "DIV", { class: true, id: true });
+			var div5_nodes = children(div5);
+			div3 = claim_element(div5_nodes, "DIV", { class: true });
+			var div3_nodes = children(div3);
+
+			svg = claim_svg_element(div3_nodes, "svg", {
+				width: true,
+				height: true,
+				version: true,
+				viewBox: true,
+				xmlns: true,
+				class: true
+			});
+
+			var svg_nodes = children(svg);
+			path0 = claim_svg_element(svg_nodes, "path", { transform: true, d: true, class: true });
+			children(path0).forEach(detach);
+			path1 = claim_svg_element(svg_nodes, "path", { transform: true, d: true, class: true });
+			children(path1).forEach(detach);
+
+			path2 = claim_svg_element(svg_nodes, "path", {
+				transform: true,
+				d: true,
+				class: true,
+				"fill-rule": true
+			});
+
+			children(path2).forEach(detach);
+
+			path3 = claim_svg_element(svg_nodes, "path", {
+				transform: true,
+				d: true,
+				class: true,
+				"fill-rule": true
+			});
+
+			children(path3).forEach(detach);
+
+			path4 = claim_svg_element(svg_nodes, "path", {
+				transform: true,
+				d: true,
+				class: true,
+				"fill-rule": true
+			});
+
+			children(path4).forEach(detach);
+
+			path5 = claim_svg_element(svg_nodes, "path", {
+				transform: true,
+				d: true,
+				class: true,
+				"fill-rule": true
+			});
+
+			children(path5).forEach(detach);
+
+			path6 = claim_svg_element(svg_nodes, "path", {
+				transform: true,
+				d: true,
+				class: true,
+				"fill-rule": true
+			});
+
+			children(path6).forEach(detach);
+
+			path7 = claim_svg_element(svg_nodes, "path", {
+				transform: true,
+				d: true,
+				class: true,
+				"fill-rule": true
+			});
+
+			children(path7).forEach(detach);
+			svg_nodes.forEach(detach);
+			div3_nodes.forEach(detach);
+			t8 = claim_space(div5_nodes);
+			div4 = claim_element(div5_nodes, "DIV", { class: true });
+			var div4_nodes = children(div4);
+			form = claim_element(div4_nodes, "FORM", { class: true });
+			var form_nodes = children(form);
+			p = claim_element(form_nodes, "P", { class: true });
+			var p_nodes = children(p);
+			t9 = claim_text(p_nodes, "Συμπληρώστε τη φόρμα κι ένας εκπρόσωπος μας θα επικοινωνήσει μαζί σας σύντομα");
+			p_nodes.forEach(detach);
+			t10 = claim_space(form_nodes);
+
+			input0 = claim_element(form_nodes, "INPUT", {
+				name: true,
+				placeholder: true,
+				class: true
+			});
+
+			t11 = claim_space(form_nodes);
+
+			input1 = claim_element(form_nodes, "INPUT", {
+				type: true,
+				name: true,
+				placeholder: true,
+				class: true
+			});
+
+			t12 = claim_space(form_nodes);
+
+			input2 = claim_element(form_nodes, "INPUT", {
+				name: true,
+				placeholder: true,
+				min: true,
+				max: true,
+				class: true
+			});
+
+			t13 = claim_space(form_nodes);
+
+			input3 = claim_element(form_nodes, "INPUT", {
+				name: true,
+				placeholder: true,
+				class: true
+			});
+
+			t14 = claim_space(form_nodes);
+			label = claim_element(form_nodes, "LABEL", { for: true });
+			var label_nodes = children(label);
+			input4 = claim_element(label_nodes, "INPUT", { type: true, id: true, class: true });
+			t15 = claim_text(label_nodes, " Αποδέχομαι τους ");
+			a2 = claim_element(label_nodes, "A", { href: true, class: true });
+			var a2_nodes = children(a2);
+			t16 = claim_text(a2_nodes, "όρους χρήσης");
+			a2_nodes.forEach(detach);
+			label_nodes.forEach(detach);
+			t17 = claim_space(form_nodes);
+			input5 = claim_element(form_nodes, "INPUT", { type: true, class: true });
+			form_nodes.forEach(detach);
+			div4_nodes.forEach(detach);
+			div5_nodes.forEach(detach);
+			t18 = claim_space(div8_nodes);
+			div7 = claim_element(div8_nodes, "DIV", { class: true });
+			var div7_nodes = children(div7);
+			div6 = claim_element(div7_nodes, "DIV", { class: true });
+			var div6_nodes = children(div6);
+			div6_nodes.forEach(detach);
+			div7_nodes.forEach(detach);
+			div8_nodes.forEach(detach);
+			this.h();
+		},
+		h() {
+			attr(button, "id", "navToggle");
+			attr(button, "title", "Menu");
+			attr(button, "class", "svelte-12obpxp");
+			attr(div0, "class", "col phone-desc svelte-12obpxp");
+			attr(span0, "class", "svelte-12obpxp");
+			attr(a0, "href", a0_href_value = "tel:" + /*mobile*/ ctx[3].split(' ').join(''));
+			attr(a0, "class", "svelte-12obpxp");
+			attr(span1, "class", "svelte-12obpxp");
+			attr(a1, "href", a1_href_value = "tel:" + /*phone*/ ctx[1].split(' ').join(''));
+			attr(a1, "class", "svelte-12obpxp");
+			attr(div1, "class", "col phone-link svelte-12obpxp");
+			attr(div2, "class", "row svelte-12obpxp");
+			attr(path0, "transform", "matrix(1 0 0 -1 1 825.9)");
+			attr(path0, "d", "m112.71 102.18 14.745-100.03h-26.337l-1.3991 17.957h-9.2937l-1.3995-17.957h-26.671l13.074 100.03zm-13.68-64.367c-1.2322 11.339-2.5273 25.376-3.9055 42.132-2.5481-19.222-4.1562-33.259-4.8456-42.132zm90.371 64.367v-100.03h-22.556l-13.408 45.483v-45.483h-21.554v100.03h21.554l14.411-45.04v45.04zm17.502 0h37.301l14.808-100.03h-65.162zm14.849-82.198h8.8137c0 1.2855-0.5431 10.896-1.6293 28.896-1.1067 17.978-1.8587 28.284-2.3182 30.919-0.4385-2.6765-1.3782-13.109-2.7777-31.298-1.3991-18.189-2.0885-27.694-2.0885-28.516zm67.439-17.831h-25.814v100.03h25.94c6.412 0 11.445-0.4003 15.079-1.2223 3.655-0.843 6.7042-2.5081 9.148-5.0375 2.4641-2.529 3.9469-5.269 4.511-8.1773 0.5432-2.9299 0.8147-7.4824 0.8147-13.658v-8.5782c0-10.011-1.9633-16.355-5.9315-19.074-3.9472-2.719-9.5865-4.089-16.876-4.089h-6.8712zm8.1454 66.496v8.0932c0 3.3724-0.5222 5.5854-1.5664 6.6391-1.0233 1.0539-3.2165 1.5808-6.579 1.5808v-25.376h1.9007c2.3391 0 3.9472 0.5689 4.8665 1.6861 0.9187 1.1381 1.3782 3.6042 1.3782 7.3768zm28.947 33.532h42.982v-19.98h-17.168v-19.095h16.04v-18.969h-16.04v-22.004h18.922v-19.981h-44.736zm110.84-58.635c0-10.053-0.2299-17.156-0.7101-21.329-0.4595-4.1942-1.9213-8.0091-4.3861-11.466-2.4644-3.4566-5.8059-6.1121-10.004-7.9668-4.1978-1.8547-9.085-2.7822-14.661-2.7822-5.305 0-10.046 0.8853-14.265 2.6345-4.2188 1.7493-7.6233 4.3628-10.171 7.8616-2.5688 3.4985-4.0935 7.3134-4.595 11.423-0.4805 4.1309-0.7308 11.339-0.7308 21.624v17.114c0 10.053 0.2296 17.156 0.7101 21.329 0.4595 4.1941 1.9216 8.009 4.3858 11.466 2.4644 3.4565 5.8062 6.1123 10.004 7.967 4.1981 1.8547 9.0853 2.782 14.662 2.782 5.3048 0 10.046-0.8853 14.264-2.6346 4.2191-1.7492 7.6233-4.3628 10.171-7.8616 2.5691-3.4985 4.0935-7.3134 4.5947-11.423 0.4805-4.1309 0.7311-11.339 0.7311-21.624zm-25.814 32.858c0 4.6366-0.2506 7.6085-0.7518 8.9152-0.5011 1.2856-1.5247 1.9389-3.0702 1.9389-1.3158 0-2.3184-0.5266-3.0285-1.5806-0.6891-1.0326-1.0443-4.1309-1.0443-9.2735v-46.684c0-5.796 0.2299-9.379 0.6894-10.728 0.4595-1.37 1.5248-2.0444 3.1955-2.0444 1.7124 0 2.8196 0.7798 3.2998 2.3394 0.4805 1.5597 0.7101 5.2903 0.7101 11.17zm68.838 5.796h-7.5189v-80.048h-25.814v100.03h59.147v-100.03h-25.814zm95.007-38.654c0-10.053-0.2296-17.156-0.7101-21.329-0.4595-4.1942-1.9213-8.0091-4.3858-11.466-2.4647-3.4566-5.8062-6.1121-10.004-7.9668-4.1981-1.8547-9.0853-2.7822-14.662-2.7822-5.305 0-10.046 0.8853-14.264 2.6345-4.2188 1.7493-7.6232 4.3628-10.171 7.8616-2.5688 3.4985-4.0935 7.3134-4.595 11.423-0.4802 4.1309-0.7308 11.339-0.7308 21.624v17.114c0 10.053 0.2299 17.156 0.7101 21.329 0.4595 4.1941 1.9216 8.009 4.3858 11.466 2.4647 3.4565 5.8062 6.1123 10.004 7.967 4.1981 1.8547 9.0853 2.782 14.662 2.782 5.3051 0 10.046-0.8853 14.265-2.6346 4.219-1.7492 7.6232-4.3628 10.171-7.8616 2.5691-3.4985 4.0935-7.3134 4.595-11.423 0.4802-4.1309 0.7308-11.339 0.7308-21.624zm-25.814 32.858c0 4.6366-0.2506 7.6085-0.7521 8.9152-0.5011 1.2856-1.5247 1.9389-3.0702 1.9389-1.3158 0-2.3181-0.5266-3.0282-1.5806-0.6894-1.0326-1.0443-4.1309-1.0443-9.2735v-46.684c0-5.796 0.2296-9.379 0.6891-10.728 0.4595-1.37 1.5248-2.0444 3.1955-2.0444 1.7127 0 2.8196 0.7798 3.3001 2.3394 0.4802 1.5597 0.7101 5.2903 0.7101 11.17zm90.391 25.776-18.797-63.82v-36.209h-23.809v36.209l-18.17 63.82h23.663c3.655-19.58 5.7645-32.732 6.2864-39.476 1.4834 10.665 3.8642 23.816 7.1847 39.476zm65.684-100.03h-27.193c-2.6524 23.31-4.8872 46.663-6.7039 70.079-1.6501-23.416-3.6343-46.769-5.9525-70.079h-27.193l13.074 100.03h39.035zm63.157 41.394c0-10.053-0.2296-17.156-0.7101-21.329-0.4595-4.1942-1.9213-8.0091-4.3857-11.466-2.4648-3.4566-5.8062-6.1121-10.004-7.9668-4.1981-1.8547-9.0853-2.7822-14.662-2.7822-5.305 0-10.046 0.8853-14.264 2.6345-4.2188 1.7493-7.6232 4.3628-10.171 7.8616-2.5687 3.4985-4.0935 7.3134-4.5949 11.423-0.4802 4.1309-0.7308 11.339-0.7308 21.624v17.114c0 10.053 0.2299 17.156 0.7101 21.329 0.4595 4.1941 1.9216 8.009 4.386 11.466 2.4644 3.4565 5.8059 6.1123 10.004 7.967 4.1979 1.8547 9.0851 2.782 14.661 2.782 5.305 0 10.046-0.8853 14.265-2.6346 4.2188-1.7492 7.6229-4.3628 10.171-7.8616 2.569-3.4985 4.0935-7.3134 4.5949-11.423 0.4802-4.1309 0.7308-11.339 0.7308-21.624zm-25.814 32.858c0 4.6366-0.2506 7.6085-0.752 8.9152-0.5012 1.2856-1.5248 1.9389-3.0702 1.9389-1.3156 0-2.3182-0.5266-3.0283-1.5806-0.6894-1.0326-1.0443-4.1309-1.0443-9.2735v-46.684c0-5.796 0.2297-9.379 0.6892-10.728 0.4594-1.37 1.5247-2.0444 3.1954-2.0444 1.7127 0 2.8197 0.7798 3.3001 2.3394 0.4802 1.5597 0.7101 5.2903 0.7101 11.17zm57.664-54.272h19.695v-19.981h-48.12l16.917 53.618-17.168 46.41h47.994v-19.98h-18.88l10.108-26.62z");
+			attr(path0, "class", "st0 svelte-12obpxp");
+			attr(path1, "transform", "matrix(1 0 0 -1 1 825.9)");
+			attr(path1, "d", "m249.2 476.19 31.92 3.8798c1.0001-8.1598 3.7199-14.4 8.1601-18.72 4.4399-4.32 9.7999-6.48 16.08-6.48 6.7601 0 12.44 2.6002 17.08 7.7601 4.6 5.1599 6.9199 12.12 6.9199 20.92 0 8.28-2.2 14.88-6.6399 19.72-4.4402 4.8399-9.8402 7.28-16.24 7.28-4.2001 0-9.2002-0.8399-15.04-2.4801l3.64 26.72c8.8801-0.2398 15.64 1.72 20.32 5.8402 4.68 4.0799 7.0002 9.5598 7.0002 16.4 0 5.8-1.7201 10.4-5.1602 13.88-3.4398 3.4398-7.9999 5.1599-13.72 5.1599-5.6398 0-10.44-1.9599-14.4-5.8799-3.9999-3.9201-6.3997-9.6401-7.2799-17.16l-30.24 5.1602c2.12 10.48 5.2801 18.84 9.5601 25.12 4.2398 6.2402 10.2 11.16 17.8 14.76 7.6 3.5601 16.16 5.3601 25.6 5.3601 16.16 0 29.12-5.1599 38.88-15.52 8.0402-8.4798 12.08-18.08 12.08-28.76 0-15.12-8.24-27.24-24.76-36.24 9.8399-2.1198 17.68-6.84 23.6-14.2 5.8799-7.3599 8.8398-16.24 8.8398-26.64 0-15.08-5.5199-27.96-16.52-38.6-11-10.64-24.68-15.96-41.08-15.96-15.52 0-28.4 4.4801-38.6 13.48-10.24 8.9601-16.16 20.68-17.8 35.2zm246.04 84.2-31.92-3.52c-0.76 6.5599-2.7998 11.4-6.0798 14.52-3.2802 3.1201-7.52 4.68-12.76 4.68-6.9599 0-12.84-3.1198-17.64-9.36-4.7999-6.2399-7.8001-19.24-9.04-39 8.2001 9.68 18.36 14.52 30.56 14.52 13.72 0 25.52-5.2399 35.32-15.72 9.7999-10.52 14.68-24.04 14.68-40.64 0-17.6-5.1599-31.76-15.48-42.4-10.32-10.64-23.56-15.96-39.72-15.96-17.32 0-31.6 6.76-42.76 20.28-11.16 13.52-16.76 35.64-16.76 66.44 0 31.56 5.8399 54.32 17.48 68.28 11.64 13.96 26.76 20.92 45.36 20.92 13.04 0 23.84-3.68 32.4-11.04 8.5598-7.3202 14-18 16.36-32zm-74.64-71.92c0-10.72 2.48-19 7.3998-24.84 4.9201-5.8403 10.52-8.7602 16.88-8.7602 6.0801 0 11.16 2.4001 15.24 7.16 4.04 4.8002 6.0798 12.64 6.0798 23.52 0 11.2-2.2 19.4-6.56 24.64-4.3999 5.2001-9.8399 7.8001-16.4 7.8001-6.3601 0-11.68-2.4801-16.08-7.4801-4.36-4.9601-6.5599-12.32-6.5599-22.04zm97-13.72 32.88 3.3999c0.9598-7.4401 3.7199-13.36 8.32-17.72 4.64-4.3599 9.9601-6.5199 16-6.5199 6.8799 0 12.72 2.7997 17.48 8.4398s7.16 14.12 7.16 25.44c0 10.64-2.3601 18.6-7.12 23.92-4.72 5.3201-10.88 7.96-18.48 7.96-9.4802 0-18-4.1599-25.52-12.48l-26.64 3.8398 16.8 89.28h87.12v-30.72h-62.12l-5.2002-29.24c7.3202 3.64 14.84 5.48 22.52 5.48 14.64 0 27.04-5.3201 37.2-16 10.2-10.64 15.28-24.48 15.28-41.52 0-14.2-4.1201-26.84-12.32-38-11.2-15.2-26.72-22.8-46.56-22.8-15.88 0-28.84 4.28-38.84 12.8-10.04 8.5601-16 20-17.96 34.44");
+			attr(path1, "class", "st0 svelte-12obpxp");
+			attr(path2, "transform", "matrix(1 0 0 -1 1 825.9)");
+			attr(path2, "d", "m473.53 824.69-67.383 0.2154-78.693-209.44h64.224z");
+			attr(path2, "class", "st1 svelte-12obpxp");
+			attr(path2, "fill-rule", "evenodd");
+			attr(path3, "transform", "matrix(1 0 0 -1 1 825.9)");
+			attr(path3, "d", "m442.35 745 45.355-129.54h66.571l-80.75 209.23z");
+			attr(path3, "class", "st2 svelte-12obpxp");
+			attr(path3, "fill-rule", "evenodd");
+			attr(path4, "transform", "matrix(1 0 0 -1 1 825.9)");
+			attr(path4, "d", "m613.96 276.11 71.739-0.1599-53.908 140.99-70.829-0.0091z");
+			attr(path4, "class", "st2 svelte-12obpxp");
+			attr(path4, "fill-rule", "evenodd");
+			attr(path5, "transform", "matrix(1 0 0 -1 1 825.9)");
+			attr(path5, "d", "m196.79 275.94 71.758 0.011 50.369 140.94-69.126 0.0448z");
+			attr(path5, "class", "st2 svelte-12obpxp");
+			attr(path5, "fill-rule", "evenodd");
+			attr(path6, "transform", "matrix(1 0 0 -1 1 825.9)");
+			attr(path6, "d", "m409.52 329.03c3.8069 2.7777 17.146 19.331 40.66 16.649-5.6036-2.7672-16.54-1.9403-30.682-14.973-6.1075-5.6282-14.625-21.432-15.977-29.68 4.7243 8.4396 8.2477 13.772 16.713 17.944 14.741 7.4897 57.458 8.3321 61.268 46.948 30.393-23.379 25.561-86.357-24.872-100.34-14.663-4.0666-20.52-2.6904-31.199-0.3515l-10.884-7.9988c6.7932-3.4974 20.368-5.2691 27.722-5.2909 45.866-0.1363 81.276 45.126 66.882 91.895-3.8914 12.644-16.212 31.795-29.625 37.432l1.1083-9.2963c-0.9283 6.8446-3.8797 12.953-6.3164 16.138-9.4921-16.961-8.979-17.308-37.857-24.36-18.413-4.496-29.244-13.979-26.942-34.712zm-3.8826-76.566c5.9199 11.509 1.1013 16.268 40.234 25.869 20.567 5.0457 31.937 15.319 30.22 37.437-3.204-3.8817-21.954-22.929-45.743-17.571 2.4525 1.215 17.559 0.9814 34.16 15.497 5.9661 5.2164 17.788 24.159 17.045 31.743-1.8697-3.598-4.8892-11.438-17.485-18.302-15.526-8.4619-29.805-4.1414-51.838-22.162-10.201-8.3427-11.014-19.044-12.788-24.327-8.8905 5.8878-16.62 27.892-17.182 38.29-0.8212 15.188 3.4872 28.399 12.555 40.452 12.43 16.524 38.062 29.561 65.98 20.588l7.2703 8.1615c-6.2858 4.8617-20.782 5.8955-28.84 5.8459-58.143-0.358-93.872-74.705-48.736-120.82 2.2865-2.3357 8.2681-6.8133 9.3121-8.6879 2.8891-3.4798 4.3915-5.7781 5.8346-12.016");
+			attr(path6, "class", "st1 svelte-12obpxp");
+			attr(path6, "fill-rule", "evenodd");
+			attr(path7, "transform", "matrix(1 0 0 -1 1 825.9)");
+			attr(path7, "d", "m232.44 505.61-8.9649 58.574-217.83 59.321c-11.121 0.8691-9.4277-54.956 38.713-68.435zm417.6 0 8.9649 58.574 217.83 59.321c11.121 0.8691 9.4277-54.956-38.713-68.435zm196.44 21.673c11.183-23.192-10.412-57.574-33.013-63.879l-160.01-44.645c-8.2738-2.4091-8.2945-4.7724-11.523 3.8821l-7.2017 20.603 6.1911 25.025c1.9123 7.4239 6.2323 6.472 12.66 8.3395zm-191.05-137.46 155.49 42.87c6.7597-5.673 2.5438-24.015 0.2298-31.652-4.6233-15.257-14.691-29.086-29.875-33.34l-100.74-28.224c-6.9712-1.9814-6.7263 2.043-9.286 8.4657zm-55.185-100.88c6.9956-14.929 6.5219-11.021-19.478-40.522l-134.94-109.24c-4.6681-3.7792-5.1098-3.3112-9.5469 0.2806l-134.57 108.95c-26 29.5-26.474 25.593-19.478 40.522 8.2381 0.1239 44.732-11.002 54.939-14.06 12.442-3.7275 14.947-1.5599 24.264-11.736l57.499-48.5c18.148-14.239 25.252-15.184 44.605 0l57.499 48.5c9.3172 10.176 11.822 8.0085 24.264 11.736 10.208 3.058 46.701 14.184 54.939 14.06zm-8.8081 26.311-29.021-7.1396 20.086 29.743zm125.81 380.69-1.6325-86.254c-5.0329-2.2374-50.804-14.888-53.813-14.372l1.7008 49.023-119.21 28.042-25.041 64.561c20.398-10.356 68.366-25.045 91.011-28.989 24.649-4.2933 60.111-14.674 106.99-12.011zm-681.25-168.66c-11.183-23.192 10.412-57.574 33.013-63.879l160.01-44.645c8.2738-2.4091 8.2945-4.7724 11.523 3.8821l7.2017 20.603-6.1912 25.025c-1.9122 7.4239-6.2322 6.472-12.66 8.3395zm191.05-137.46-155.49 42.87c-6.7598-5.673-2.5438-24.015-0.2299-31.652 4.6233-15.257 14.691-29.086 29.875-33.34l100.74-28.224c6.9713-1.9814 6.7263 2.043 9.286 8.4657zm63.994-74.571 29.021-7.1396-20.086 29.743zm-125.81 380.69 1.6325-86.254c5.0329-2.2374 50.804-14.888 53.813-14.372l-1.7008 49.023 119.21 28.042 25.041 64.561c-20.398-10.356-68.366-25.045-91.011-28.989-24.649-4.2933-60.111-14.674-106.99-12.011");
+			attr(path7, "class", "st0 svelte-12obpxp");
+			attr(path7, "fill-rule", "evenodd");
+			attr(svg, "width", "360");
+			attr(svg, "height", "360");
+			attr(svg, "version", "1.1");
+			attr(svg, "viewBox", "0 0 884.48 826.9");
+			attr(svg, "xmlns", "http://www.w3.org/2000/svg");
+			attr(svg, "class", "svelte-12obpxp");
+			attr(div3, "class", "col svelte-12obpxp");
+			attr(p, "class", "svelte-12obpxp");
+			attr(input0, "name", "name");
+			input0.required = true;
+			attr(input0, "placeholder", "Ονοματεπώνυμο");
+			attr(input0, "class", "svelte-12obpxp");
+			attr(input1, "type", "email");
+			attr(input1, "name", "email");
+			input1.required = true;
+			attr(input1, "placeholder", "Email");
+			attr(input1, "class", "svelte-12obpxp");
+			attr(input2, "name", "phone");
+			input2.required = true;
+			attr(input2, "placeholder", "Τηλέφωνο");
+			attr(input2, "min", "10");
+			attr(input2, "max", "14");
+			attr(input2, "class", "svelte-12obpxp");
+			attr(input3, "name", "address");
+			input3.required = true;
+			attr(input3, "placeholder", "Διεύθυνση");
+			attr(input3, "class", "svelte-12obpxp");
+			attr(input4, "type", "checkbox");
+			attr(input4, "id", "tos");
+			input4.required = true;
+			attr(input4, "class", "svelte-12obpxp");
+			attr(a2, "href", "/oroi-xrisis");
+			attr(a2, "class", "svelte-12obpxp");
+			attr(label, "for", "tos");
+			attr(input5, "type", "submit");
+			input5.value = "Αποστολή";
+			attr(input5, "class", "svelte-12obpxp");
+			attr(form, "class", "svelte-12obpxp");
+			attr(div4, "class", "col svelte-12obpxp");
+			attr(div5, "class", "row svelte-12obpxp");
+			attr(div5, "id", "middle");
+			attr(div6, "class", "col headlines svelte-12obpxp");
+			attr(div7, "class", "row svelte-12obpxp");
+			attr(div8, "class", "section-container header svelte-12obpxp");
+		},
+		m(target, anchor) {
+			insert_hydration(target, button, anchor);
+			if_blocks[current_block_type_index].m(button, null);
+			insert_hydration(target, t0, anchor);
+			if (if_block1) if_block1.m(target, anchor);
+			insert_hydration(target, t1, anchor);
+			insert_hydration(target, div8, anchor);
+			append_hydration(div8, div2);
+			append_hydration(div2, div0);
+			append_hydration(div0, t2);
+			append_hydration(div2, t3);
+			append_hydration(div2, div1);
+			append_hydration(div1, a0);
+			mount_component(icon0, a0, null);
+			append_hydration(a0, span0);
+			append_hydration(span0, t4);
+			append_hydration(div1, t5);
+			append_hydration(div1, a1);
+			mount_component(icon1, a1, null);
+			append_hydration(a1, span1);
+			append_hydration(span1, t6);
+			append_hydration(div8, t7);
+			append_hydration(div8, div5);
+			append_hydration(div5, div3);
+			append_hydration(div3, svg);
+			append_hydration(svg, path0);
+			append_hydration(svg, path1);
+			append_hydration(svg, path2);
+			append_hydration(svg, path3);
+			append_hydration(svg, path4);
+			append_hydration(svg, path5);
+			append_hydration(svg, path6);
+			append_hydration(svg, path7);
+			append_hydration(div5, t8);
+			append_hydration(div5, div4);
+			append_hydration(div4, form);
+			append_hydration(form, p);
+			append_hydration(p, t9);
+			append_hydration(form, t10);
+			append_hydration(form, input0);
+			append_hydration(form, t11);
+			append_hydration(form, input1);
+			append_hydration(form, t12);
+			append_hydration(form, input2);
+			append_hydration(form, t13);
+			append_hydration(form, input3);
+			append_hydration(form, t14);
+			append_hydration(form, label);
+			append_hydration(label, input4);
+			append_hydration(label, t15);
+			append_hydration(label, a2);
+			append_hydration(a2, t16);
+			append_hydration(form, t17);
+			append_hydration(form, input5);
+			append_hydration(div8, t18);
+			append_hydration(div8, div7);
+			append_hydration(div7, div6);
+			div6.innerHTML = /*text*/ ctx[4];
+			current = true;
+
+			if (!mounted) {
+				dispose = [
+					listen(button, "click", /*click_handler*/ ctx[21]),
+					listen(form, "submit", /*book*/ ctx[6])
+				];
+
+				mounted = true;
+			}
+		},
+		p(ctx, [dirty]) {
+			let previous_block_index = current_block_type_index;
+			current_block_type_index = select_block_type(ctx);
+
+			if (current_block_type_index !== previous_block_index) {
+				group_outros();
+
+				transition_out(if_blocks[previous_block_index], 1, 1, () => {
+					if_blocks[previous_block_index] = null;
+				});
+
+				check_outros();
+				if_block0 = if_blocks[current_block_type_index];
+
+				if (!if_block0) {
+					if_block0 = if_blocks[current_block_type_index] = if_block_creators[current_block_type_index](ctx);
+					if_block0.c();
+				}
+
+				transition_in(if_block0, 1);
+				if_block0.m(button, null);
+			}
+
+			if (/*menu*/ ctx[5]) {
+				if (if_block1) {
+					if_block1.p(ctx, dirty);
+
+					if (dirty & /*menu*/ 32) {
+						transition_in(if_block1, 1);
+					}
+				} else {
+					if_block1 = create_if_block$1(ctx);
+					if_block1.c();
+					transition_in(if_block1, 1);
+					if_block1.m(t1.parentNode, t1);
+				}
+			} else if (if_block1) {
+				group_outros();
+
+				transition_out(if_block1, 1, 1, () => {
+					if_block1 = null;
+				});
+
+				check_outros();
+			}
+
+			if (!current || dirty & /*mobile*/ 8) set_data(t4, /*mobile*/ ctx[3]);
+
+			if (!current || dirty & /*mobile*/ 8 && a0_href_value !== (a0_href_value = "tel:" + /*mobile*/ ctx[3].split(' ').join(''))) {
+				attr(a0, "href", a0_href_value);
+			}
+
+			if (!current || dirty & /*phone*/ 2) set_data(t6, /*phone*/ ctx[1]);
+
+			if (!current || dirty & /*phone*/ 2 && a1_href_value !== (a1_href_value = "tel:" + /*phone*/ ctx[1].split(' ').join(''))) {
+				attr(a1, "href", a1_href_value);
+			}
+
+			if (!current || dirty & /*text*/ 16) div6.innerHTML = /*text*/ ctx[4];		},
+		i(local) {
+			if (current) return;
+			transition_in(if_block0);
+			transition_in(if_block1);
+			transition_in(icon0.$$.fragment, local);
+			transition_in(icon1.$$.fragment, local);
+			current = true;
+		},
+		o(local) {
+			transition_out(if_block0);
+			transition_out(if_block1);
+			transition_out(icon0.$$.fragment, local);
+			transition_out(icon1.$$.fragment, local);
+			current = false;
+		},
+		d(detaching) {
+			if (detaching) detach(button);
+			if_blocks[current_block_type_index].d();
+			if (detaching) detach(t0);
+			if (if_block1) if_block1.d(detaching);
+			if (detaching) detach(t1);
+			if (detaching) detach(div8);
+			destroy_component(icon0);
+			destroy_component(icon1);
+			mounted = false;
+			run_all(dispose);
+		}
+	};
+}
+
+function instance$1($$self, $$props, $$invalidate) {
+	let { company } = $$props;
+	let { address } = $$props;
+	let { phone } = $$props;
+	let { email } = $$props;
+	let { social } = $$props;
+	let { nav } = $$props;
+	let { cta } = $$props;
+	let { breadcrumbs } = $$props;
+	let { mobile } = $$props;
+	let { jsdoj } = $$props;
+	let { pfjyn } = $$props;
+	let { gxlkm } = $$props;
+	let { nmtxv } = $$props;
+	let { mkegn } = $$props;
+	let { zecgs } = $$props;
+	let { cxxvx } = $$props;
+	let { seo_title } = $$props;
+	let { seo_description } = $$props;
+	let { text } = $$props;
+
+	let book = () => {
+		
+	};
+
+	let menu = false;
+	const click_handler = () => $$invalidate(5, menu = !menu);
+	const click_handler_1 = (item, each_value_1, item_index_1) => $$invalidate(0, each_value_1[item_index_1].open = !item.open, nav);
+
+	$$self.$$set = $$props => {
+		if ('company' in $$props) $$invalidate(7, company = $$props.company);
+		if ('address' in $$props) $$invalidate(8, address = $$props.address);
+		if ('phone' in $$props) $$invalidate(1, phone = $$props.phone);
+		if ('email' in $$props) $$invalidate(9, email = $$props.email);
+		if ('social' in $$props) $$invalidate(10, social = $$props.social);
+		if ('nav' in $$props) $$invalidate(0, nav = $$props.nav);
+		if ('cta' in $$props) $$invalidate(2, cta = $$props.cta);
+		if ('breadcrumbs' in $$props) $$invalidate(11, breadcrumbs = $$props.breadcrumbs);
+		if ('mobile' in $$props) $$invalidate(3, mobile = $$props.mobile);
+		if ('jsdoj' in $$props) $$invalidate(12, jsdoj = $$props.jsdoj);
+		if ('pfjyn' in $$props) $$invalidate(13, pfjyn = $$props.pfjyn);
+		if ('gxlkm' in $$props) $$invalidate(14, gxlkm = $$props.gxlkm);
+		if ('nmtxv' in $$props) $$invalidate(15, nmtxv = $$props.nmtxv);
+		if ('mkegn' in $$props) $$invalidate(16, mkegn = $$props.mkegn);
+		if ('zecgs' in $$props) $$invalidate(17, zecgs = $$props.zecgs);
+		if ('cxxvx' in $$props) $$invalidate(18, cxxvx = $$props.cxxvx);
+		if ('seo_title' in $$props) $$invalidate(19, seo_title = $$props.seo_title);
+		if ('seo_description' in $$props) $$invalidate(20, seo_description = $$props.seo_description);
+		if ('text' in $$props) $$invalidate(4, text = $$props.text);
+	};
+
+	return [
+		nav,
+		phone,
+		cta,
+		mobile,
+		text,
+		menu,
+		book,
+		company,
+		address,
+		email,
+		social,
+		breadcrumbs,
+		jsdoj,
+		pfjyn,
+		gxlkm,
+		nmtxv,
+		mkegn,
+		zecgs,
+		cxxvx,
+		seo_title,
+		seo_description,
+		click_handler,
+		click_handler_1
+	];
+}
+
+class Component$1 extends SvelteComponent {
+	constructor(options) {
+		super();
+
+		init(this, options, instance$1, create_fragment$1, safe_not_equal, {
+			company: 7,
+			address: 8,
+			phone: 1,
+			email: 9,
+			social: 10,
+			nav: 0,
+			cta: 2,
+			breadcrumbs: 11,
+			mobile: 3,
+			jsdoj: 12,
+			pfjyn: 13,
+			gxlkm: 14,
+			nmtxv: 15,
+			mkegn: 16,
+			zecgs: 17,
+			cxxvx: 18,
+			seo_title: 19,
+			seo_description: 20,
+			text: 4
+		});
+	}
+}
+
+export default Component$1;
